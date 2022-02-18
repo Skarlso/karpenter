@@ -61,8 +61,6 @@ metadata:
   name: ${CLUSTER_NAME}
   region: ${AWS_DEFAULT_REGION}
   version: "1.21"
-  tags:
-    karpenter.sh/discovery: ${CLUSTER_NAME}
 managedNodeGroups:
   - instanceType: m5.large
     amiFamily: AmazonLinux2
@@ -77,6 +75,15 @@ eksctl create cluster -f cluster.yaml
 
 export CLUSTER_ENDPOINT="$(aws eks describe-cluster --name ${CLUSTER_NAME} --query "cluster.endpoint" --output text)"
 ```
+
+_Note_: There are some necessary tags that needs to be applied to all Security Groups and Subnets:
+
+```yaml
+  tags:
+    karpenter.sh/discovery: ${CLUSTER_NAME}
+```
+
+This is automatically done by `eksctl` during cluster creation.
 
 This guide uses a managed node group to host Karpenter.
 
