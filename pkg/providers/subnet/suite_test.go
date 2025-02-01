@@ -16,55 +16,47 @@ package subnet_test
 
 import (
 	"context"
+	"sort"
+	"sync"
 	"testing"
 
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sigs.k8s.io/karpenter/pkg/test/v1alpha1"
 
-	"github.com/aws/aws-sdk-go/aws"
-	v1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/runtime/schema"
+	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
+	"github.com/samber/lo"
+
+	"github.com/aws/karpenter-provider-aws/pkg/apis"
+	v1 "github.com/aws/karpenter-provider-aws/pkg/apis/v1"
+	"github.com/aws/karpenter-provider-aws/pkg/operator/options"
+	"github.com/aws/karpenter-provider-aws/pkg/test"
+
+	coreoptions "sigs.k8s.io/karpenter/pkg/operator/options"
+	coretest "sigs.k8s.io/karpenter/pkg/test"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
-	. "knative.dev/pkg/logging/testing"
-
-	"github.com/aws/karpenter/pkg/apis"
-	awssettings "github.com/aws/karpenter/pkg/apis/settings"
-	"github.com/aws/karpenter/pkg/apis/v1alpha1"
-	"github.com/aws/karpenter/pkg/providers/subnet"
-	"github.com/aws/karpenter/pkg/test"
-
-	"github.com/aws/karpenter-core/pkg/apis/settings"
-	corev1alpha5 "github.com/aws/karpenter-core/pkg/apis/v1alpha5"
-	"github.com/aws/karpenter-core/pkg/operator/injection"
-	"github.com/aws/karpenter-core/pkg/operator/options"
-	"github.com/aws/karpenter-core/pkg/operator/scheme"
-	coretest "github.com/aws/karpenter-core/pkg/test"
-	. "github.com/aws/karpenter-core/pkg/test/expectations"
-	"github.com/aws/karpenter/pkg/fake"
+	. "sigs.k8s.io/karpenter/pkg/test/expectations"
+	. "sigs.k8s.io/karpenter/pkg/utils/testing"
 )
 
 var ctx context.Context
 var stop context.CancelFunc
-var opts options.Options
 var env *coretest.Environment
-var fakeEC2API *fake.EC2API
-var provisioner *corev1alpha5.Provisioner
-var nodeTemplate *v1alpha1.AWSNodeTemplate
-var subnetProvider *subnet.Provider
+var awsEnv *test.Environment
+var nodeClass *v1.EC2NodeClass
 
 func TestAWS(t *testing.T) {
 	ctx = TestContextWithLogger(t)
 	RegisterFailHandler(Fail)
-	RunSpecs(t, "CloudProvider/AWS")
+	RunSpecs(t, "SubnetProvider")
 }
 
 var _ = BeforeSuite(func() {
-	env = coretest.NewEnvironment(scheme.Scheme, coretest.WithCRDs(apis.CRDs...))
+	env = coretest.NewEnvironment(coretest.WithCRDs(apis.CRDs...), coretest.WithCRDs(v1alpha1.CRDs...))
+	ctx = coreoptions.ToContext(ctx, coretest.Options())
+	ctx = options.ToContext(ctx, test.Options())
 	ctx, stop = context.WithCancel(ctx)
-
-	fakeEC2API = &fake.EC2API{}
-	subnetProvider = subnet.NewProvider(fakeEC2API)
+	awsEnv = test.NewEnvironment(ctx, env)
 })
 
 var _ = AfterSuite(func() {
@@ -73,114 +65,320 @@ var _ = AfterSuite(func() {
 })
 
 var _ = BeforeEach(func() {
-	ctx = injection.WithOptions(ctx, opts)
-	ctx = settings.ToContext(ctx, coretest.Settings())
-	ctx = awssettings.ToContext(ctx, test.Settings())
-	nodeTemplate = &v1alpha1.AWSNodeTemplate{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: coretest.RandomName(),
-		},
-		Spec: v1alpha1.AWSNodeTemplateSpec{
-			AWS: v1alpha1.AWS{
-				AMIFamily:             aws.String(v1alpha1.AMIFamilyAL2),
-				SubnetSelector:        map[string]string{"*": "*"},
-				SecurityGroupSelector: map[string]string{"*": "*"},
+	ctx = coreoptions.ToContext(ctx, coretest.Options())
+	ctx = options.ToContext(ctx, test.Options())
+	nodeClass = test.EC2NodeClass(v1.EC2NodeClass{
+		Spec: v1.EC2NodeClassSpec{
+			AMISelectorTerms: []v1.AMISelectorTerm{{
+				Alias: "al2@latest",
+			}},
+			SubnetSelectorTerms: []v1.SubnetSelectorTerm{
+				{
+					Tags: map[string]string{
+						"*": "*",
+					},
+				},
+			},
+			SecurityGroupSelectorTerms: []v1.SecurityGroupSelectorTerm{
+				{
+					Tags: map[string]string{
+						"*": "*",
+					},
+				},
 			},
 		},
-	}
-	nodeTemplate.SetGroupVersionKind(schema.GroupVersionKind{
-		Group:   v1alpha1.SchemeGroupVersion.Group,
-		Version: v1alpha1.SchemeGroupVersion.Version,
-		Kind:    "AWSNodeTemplate",
 	})
-	provisioner = test.Provisioner(coretest.ProvisionerOptions{
-		Requirements: []v1.NodeSelectorRequirement{{
-			Key:      v1alpha1.LabelInstanceCategory,
-			Operator: v1.NodeSelectorOpExists,
-		}},
-		ProviderRef: &corev1alpha5.ProviderRef{
-			APIVersion: nodeTemplate.APIVersion,
-			Kind:       nodeTemplate.Kind,
-			Name:       nodeTemplate.Name,
-		},
-	})
-
-	fakeEC2API.Reset()
-	subnetProvider.Reset()
+	awsEnv.Reset()
 })
 
 var _ = AfterEach(func() {
 	ExpectCleanedUp(ctx, env.Client)
 })
 
-var _ = Describe("Security Group Provider", func() {
-	It("should discover subnet by ID", func() {
-		nodeTemplate.Spec.SubnetSelector = map[string]string{"aws-ids": "subnet-test1"}
-		ExpectApplied(ctx, env.Client, provisioner, nodeTemplate)
-		resolvedSubnetProvider, err := subnetProvider.List(ctx, nodeTemplate)
-		resolvedSubnet := subnet.Pretty(resolvedSubnetProvider)
-		Expect(err).To(BeNil())
-		Expect(len(resolvedSubnet)).To(Equal(1))
-		Expect(resolvedSubnet).To(ConsistOf(
-			"subnet-test1 (test-zone-1a)",
-		))
+var _ = Describe("SubnetProvider", func() {
+	Context("List", func() {
+		It("should discover subnet by ID", func() {
+			nodeClass.Spec.SubnetSelectorTerms = []v1.SubnetSelectorTerm{
+				{
+					ID: "subnet-test1",
+				},
+			}
+			subnets, err := awsEnv.SubnetProvider.List(ctx, nodeClass)
+			Expect(err).To(BeNil())
+			ExpectConsistsOfSubnets([]ec2types.Subnet{
+				{
+					SubnetId:                lo.ToPtr("subnet-test1"),
+					AvailabilityZone:        lo.ToPtr("test-zone-1a"),
+					AvailabilityZoneId:      lo.ToPtr("tstz1-1a"),
+					AvailableIpAddressCount: lo.ToPtr[int32](100),
+				},
+			}, subnets)
+		})
+		It("should discover subnets by IDs", func() {
+			nodeClass.Spec.SubnetSelectorTerms = []v1.SubnetSelectorTerm{
+				{
+					ID: "subnet-test1",
+				},
+				{
+					ID: "subnet-test2",
+				},
+			}
+			subnets, err := awsEnv.SubnetProvider.List(ctx, nodeClass)
+			Expect(err).To(BeNil())
+			ExpectConsistsOfSubnets([]ec2types.Subnet{
+				{
+					SubnetId:                lo.ToPtr("subnet-test1"),
+					AvailabilityZone:        lo.ToPtr("test-zone-1a"),
+					AvailabilityZoneId:      lo.ToPtr("tstz1-1a"),
+					AvailableIpAddressCount: lo.ToPtr[int32](100),
+				},
+				{
+					SubnetId:                lo.ToPtr("subnet-test2"),
+					AvailabilityZone:        lo.ToPtr("test-zone-1b"),
+					AvailabilityZoneId:      lo.ToPtr("tstz1-1b"),
+					AvailableIpAddressCount: lo.ToPtr[int32](100),
+				},
+			}, subnets)
+		})
+		It("should discover subnets by IDs and tags", func() {
+			nodeClass.Spec.SubnetSelectorTerms = []v1.SubnetSelectorTerm{
+				{
+					ID:   "subnet-test1",
+					Tags: map[string]string{"foo": "bar"},
+				},
+				{
+					ID:   "subnet-test2",
+					Tags: map[string]string{"foo": "bar"},
+				},
+			}
+			subnets, err := awsEnv.SubnetProvider.List(ctx, nodeClass)
+			Expect(err).To(BeNil())
+			ExpectConsistsOfSubnets([]ec2types.Subnet{
+				{
+					SubnetId:                lo.ToPtr("subnet-test1"),
+					AvailabilityZone:        lo.ToPtr("test-zone-1a"),
+					AvailabilityZoneId:      lo.ToPtr("tstz1-1a"),
+					AvailableIpAddressCount: lo.ToPtr[int32](100),
+				},
+				{
+					SubnetId:                lo.ToPtr("subnet-test2"),
+					AvailabilityZone:        lo.ToPtr("test-zone-1b"),
+					AvailabilityZoneId:      lo.ToPtr("tstz1-1b"),
+					AvailableIpAddressCount: lo.ToPtr[int32](100),
+				},
+			}, subnets)
+		})
+		It("should discover subnets by a single tag", func() {
+			nodeClass.Spec.SubnetSelectorTerms = []v1.SubnetSelectorTerm{
+				{
+					Tags: map[string]string{"Name": "test-subnet-1"},
+				},
+			}
+			subnets, err := awsEnv.SubnetProvider.List(ctx, nodeClass)
+			Expect(err).To(BeNil())
+			ExpectConsistsOfSubnets([]ec2types.Subnet{
+				{
+					SubnetId:                lo.ToPtr("subnet-test1"),
+					AvailabilityZone:        lo.ToPtr("test-zone-1a"),
+					AvailabilityZoneId:      lo.ToPtr("tstz1-1a"),
+					AvailableIpAddressCount: lo.ToPtr[int32](100),
+				},
+			}, subnets)
+		})
+		It("should discover subnets by multiple tag values", func() {
+			nodeClass.Spec.SubnetSelectorTerms = []v1.SubnetSelectorTerm{
+				{
+					Tags: map[string]string{"Name": "test-subnet-1"},
+				},
+				{
+					Tags: map[string]string{"Name": "test-subnet-2"},
+				},
+			}
+			subnets, err := awsEnv.SubnetProvider.List(ctx, nodeClass)
+			Expect(err).To(BeNil())
+			ExpectConsistsOfSubnets([]ec2types.Subnet{
+				{
+					SubnetId:                lo.ToPtr("subnet-test1"),
+					AvailabilityZone:        lo.ToPtr("test-zone-1a"),
+					AvailabilityZoneId:      lo.ToPtr("tstz1-1a"),
+					AvailableIpAddressCount: lo.ToPtr[int32](100),
+				},
+				{
+					SubnetId:                lo.ToPtr("subnet-test2"),
+					AvailabilityZone:        lo.ToPtr("test-zone-1b"),
+					AvailabilityZoneId:      lo.ToPtr("tstz1-1b"),
+					AvailableIpAddressCount: lo.ToPtr[int32](100),
+				},
+			}, subnets)
+		})
+		It("should discover subnets by IDs intersected with tags", func() {
+			nodeClass.Spec.SubnetSelectorTerms = []v1.SubnetSelectorTerm{
+				{
+					ID:   "subnet-test2",
+					Tags: map[string]string{"foo": "bar"},
+				},
+			}
+			subnets, err := awsEnv.SubnetProvider.List(ctx, nodeClass)
+			Expect(err).To(BeNil())
+			ExpectConsistsOfSubnets([]ec2types.Subnet{
+				{
+					SubnetId:                lo.ToPtr("subnet-test2"),
+					AvailabilityZone:        lo.ToPtr("test-zone-1b"),
+					AvailabilityZoneId:      lo.ToPtr("tstz1-1b"),
+					AvailableIpAddressCount: lo.ToPtr[int32](100),
+				},
+			}, subnets)
+		})
 	})
-	It("should discover subnets by IDs", func() {
-		nodeTemplate.Spec.SubnetSelector = map[string]string{"aws-ids": "subnet-test1,subnet-test2"}
-		ExpectApplied(ctx, env.Client, provisioner, nodeTemplate)
-		resolvedSubnetProvider, err := subnetProvider.List(ctx, nodeTemplate)
-		resolvedSubnet := subnet.Pretty(resolvedSubnetProvider)
-		Expect(err).To(BeNil())
-		Expect(len(resolvedSubnet)).To(Equal(2))
-		Expect(resolvedSubnet).To(ConsistOf(
-			"subnet-test1 (test-zone-1a)",
-			"subnet-test2 (test-zone-1b)",
-		))
+	Context("Provider Cache", func() {
+		It("should resolve subnets from cache that are filtered by id", func() {
+			expectedSubnets := awsEnv.EC2API.DescribeSubnetsOutput.Clone().Subnets
+			for _, subnet := range expectedSubnets {
+				nodeClass.Spec.SubnetSelectorTerms = []v1.SubnetSelectorTerm{
+					{
+						ID: *subnet.SubnetId,
+					},
+				}
+				// Call list to request from aws and store in the cache
+				_, err := awsEnv.SubnetProvider.List(ctx, nodeClass)
+				Expect(err).To(BeNil())
+			}
+
+			for _, cachedObject := range awsEnv.SubnetCache.Items() {
+				cachedSubnet := cachedObject.Object.([]ec2types.Subnet)
+				Expect(cachedSubnet).To(HaveLen(1))
+				lo.Contains(lo.ToSlicePtr(expectedSubnets), lo.ToPtr(cachedSubnet[0]))
+			}
+		})
+		It("should resolve subnets from cache that are filtered by tags", func() {
+			expectedSubnets := awsEnv.EC2API.DescribeSubnetsOutput.Clone().Subnets
+			tagSet := lo.Map(expectedSubnets, func(subnet ec2types.Subnet, _ int) map[string]string {
+				tag, _ := lo.Find(subnet.Tags, func(tag ec2types.Tag) bool {
+					return lo.FromPtr(tag.Key) == "Name"
+				})
+				return map[string]string{"Name": lo.FromPtr(tag.Value)}
+			})
+			for _, tag := range tagSet {
+				nodeClass.Spec.SubnetSelectorTerms = []v1.SubnetSelectorTerm{
+					{
+						Tags: tag,
+					},
+				}
+				// Call list to request from aws and store in the cache
+				_, err := awsEnv.SubnetProvider.List(ctx, nodeClass)
+				Expect(err).To(BeNil())
+			}
+
+			for _, cachedObject := range awsEnv.SubnetCache.Items() {
+				cachedSubnet := cachedObject.Object.([]ec2types.Subnet)
+				Expect(cachedSubnet).To(HaveLen(1))
+				lo.Contains(lo.ToSlicePtr(expectedSubnets), lo.ToPtr(cachedSubnet[0]))
+			}
+		})
 	})
-	It("should discover subnets by IDs and tags", func() {
-		nodeTemplate.Spec.SubnetSelector = map[string]string{"aws-ids": "subnet-test1,subnet-test2", "foo": "bar"}
-		ExpectApplied(ctx, env.Client, provisioner, nodeTemplate)
-		resolvedSubnetProvider, err := subnetProvider.List(ctx, nodeTemplate)
-		resolvedSubnet := subnet.Pretty(resolvedSubnetProvider)
-		Expect(err).To(BeNil())
-		Expect(len(resolvedSubnet)).To(Equal(2))
-		Expect(resolvedSubnet).To(ConsistOf(
-			"subnet-test1 (test-zone-1a)",
-			"subnet-test2 (test-zone-1b)",
-		))
-	})
-	It("should discover subnets by a single tag", func() {
-		nodeTemplate.Spec.SubnetSelector = map[string]string{"Name": "test-subnet-1"}
-		ExpectApplied(ctx, env.Client, provisioner, nodeTemplate)
-		resolvedSubnetProvider, err := subnetProvider.List(ctx, nodeTemplate)
-		resolvedSubnet := subnet.Pretty(resolvedSubnetProvider)
-		Expect(err).To(BeNil())
-		Expect(len(resolvedSubnet)).To(Equal(1))
-		Expect(resolvedSubnet).To(ConsistOf(
-			"subnet-test1 (test-zone-1a)",
-		))
-	})
-	It("should discover subnets by multiple tag values", func() {
-		nodeTemplate.Spec.SubnetSelector = map[string]string{"Name": "test-subnet-1,test-subnet-2"}
-		ExpectApplied(ctx, env.Client, provisioner, nodeTemplate)
-		resolvedSubnetProvider, err := subnetProvider.List(ctx, nodeTemplate)
-		resolvedSubnet := subnet.Pretty(resolvedSubnetProvider)
-		Expect(err).To(BeNil())
-		Expect(len(resolvedSubnet)).To(Equal(2))
-		Expect(resolvedSubnet).To(ConsistOf(
-			"subnet-test1 (test-zone-1a)",
-			"subnet-test2 (test-zone-1b)",
-		))
-	})
-	It("should discover subnets by IDs intersected with tags", func() {
-		nodeTemplate.Spec.SubnetSelector = map[string]string{"aws-ids": "subnet-test2", "foo": "bar"}
-		ExpectApplied(ctx, env.Client, provisioner, nodeTemplate)
-		resolvedSubnetProvider, err := subnetProvider.List(ctx, nodeTemplate)
-		resolvedSubnet := subnet.Pretty(resolvedSubnetProvider)
-		Expect(err).To(BeNil())
-		Expect(len(resolvedSubnet)).To(Equal(1))
-		Expect(resolvedSubnet).To(ConsistOf(
-			"subnet-test2 (test-zone-1b)",
-		))
+	It("should not cause data races when calling List() simultaneously", func() {
+		wg := sync.WaitGroup{}
+		for i := 0; i < 10000; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				defer GinkgoRecover()
+				subnets, err := awsEnv.SubnetProvider.List(ctx, nodeClass)
+				Expect(err).ToNot(HaveOccurred())
+
+				Expect(subnets).To(HaveLen(4))
+				// Sort everything in parallel and ensure that we don't get data races
+				sort.Slice(subnets, func(i, j int) bool {
+					if int(*subnets[i].AvailableIpAddressCount) != int(*subnets[j].AvailableIpAddressCount) {
+						return int(*subnets[i].AvailableIpAddressCount) > int(*subnets[j].AvailableIpAddressCount)
+					}
+					return *subnets[i].SubnetId < *subnets[j].SubnetId
+				})
+				Expect(subnets).To(BeEquivalentTo([]ec2types.Subnet{
+					{
+						AvailabilityZone:        lo.ToPtr("test-zone-1a"),
+						AvailabilityZoneId:      lo.ToPtr("tstz1-1a"),
+						AvailableIpAddressCount: lo.ToPtr[int32](100),
+						SubnetId:                lo.ToPtr("subnet-test1"),
+						MapPublicIpOnLaunch:     lo.ToPtr(false),
+						Tags: []ec2types.Tag{
+							{
+								Key:   lo.ToPtr("Name"),
+								Value: lo.ToPtr("test-subnet-1"),
+							},
+							{
+								Key:   lo.ToPtr("foo"),
+								Value: lo.ToPtr("bar"),
+							},
+						},
+					},
+					{
+						AvailabilityZone:        lo.ToPtr("test-zone-1b"),
+						AvailabilityZoneId:      lo.ToPtr("tstz1-1b"),
+						AvailableIpAddressCount: lo.ToPtr[int32](100),
+						MapPublicIpOnLaunch:     lo.ToPtr(true),
+						SubnetId:                lo.ToPtr("subnet-test2"),
+
+						Tags: []ec2types.Tag{
+							{
+								Key:   lo.ToPtr("Name"),
+								Value: lo.ToPtr("test-subnet-2"),
+							},
+							{
+								Key:   lo.ToPtr("foo"),
+								Value: lo.ToPtr("bar"),
+							},
+						},
+					},
+					{
+						AvailabilityZone:        lo.ToPtr("test-zone-1c"),
+						AvailabilityZoneId:      lo.ToPtr("tstz1-1c"),
+						AvailableIpAddressCount: lo.ToPtr[int32](100),
+						SubnetId:                lo.ToPtr("subnet-test3"),
+						Tags: []ec2types.Tag{
+							{
+								Key:   lo.ToPtr("Name"),
+								Value: lo.ToPtr("test-subnet-3"),
+							},
+							{
+								Key: lo.ToPtr("TestTag"),
+							},
+							{
+								Key:   lo.ToPtr("foo"),
+								Value: lo.ToPtr("bar"),
+							},
+						},
+					},
+					{
+						AvailabilityZone:        lo.ToPtr("test-zone-1a-local"),
+						AvailabilityZoneId:      lo.ToPtr("tstz1-1alocal"),
+						AvailableIpAddressCount: lo.ToPtr[int32](100),
+						SubnetId:                lo.ToPtr("subnet-test4"),
+						MapPublicIpOnLaunch:     lo.ToPtr(true),
+						Tags: []ec2types.Tag{
+							{
+								Key:   lo.ToPtr("Name"),
+								Value: lo.ToPtr("test-subnet-4"),
+							},
+						},
+					},
+				}))
+			}()
+		}
+		wg.Wait()
 	})
 })
+
+func ExpectConsistsOfSubnets(expected, actual []ec2types.Subnet) {
+	GinkgoHelper()
+	Expect(actual).To(HaveLen(len(expected)))
+	for _, elem := range expected {
+		_, ok := lo.Find(actual, func(s ec2types.Subnet) bool {
+			return lo.FromPtr(s.SubnetId) == lo.FromPtr(elem.SubnetId) &&
+				lo.FromPtr(s.AvailabilityZoneId) == lo.FromPtr(elem.AvailabilityZoneId) &&
+				lo.FromPtr(s.AvailabilityZone) == lo.FromPtr(elem.AvailabilityZone) &&
+				lo.FromPtr(s.AvailableIpAddressCount) == lo.FromPtr(elem.AvailableIpAddressCount)
+		})
+		Expect(ok).To(BeTrue(), `Expected subnet with {"SubnetId": %q, "AvailabilityZone": %q, "AvailableIpAddressCount": %q} to exist`, lo.FromPtr(elem.SubnetId), lo.FromPtr(elem.AvailabilityZone), lo.FromPtr(elem.AvailableIpAddressCount))
+	}
+}

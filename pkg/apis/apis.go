@@ -18,37 +18,23 @@ package apis
 import (
 	_ "embed"
 
-	v1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
-	"k8s.io/apimachinery/pkg/runtime"
-
-	"github.com/aws/karpenter-core/pkg/operator/scheme"
-	"github.com/aws/karpenter/pkg/apis/settings"
-
-	"github.com/samber/lo"
-
-	"github.com/aws/karpenter-core/pkg/apis"
-	coresettings "github.com/aws/karpenter-core/pkg/apis/settings"
-	"github.com/aws/karpenter-core/pkg/utils/functional"
-	"github.com/aws/karpenter/pkg/apis/v1alpha1"
-)
-
-var (
-	// Builder includes all types within the apis package
-	Builder = runtime.NewSchemeBuilder(
-		v1alpha1.SchemeBuilder.AddToScheme,
-	)
-	// AddToScheme may be used to add all resources defined in the project to a Scheme
-	AddToScheme = Builder.AddToScheme
-	Settings    = []coresettings.Injectable{&settings.Settings{}}
+	"github.com/awslabs/operatorpkg/object"
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 )
 
 //go:generate controller-gen crd object:headerFile="../../hack/boilerplate.go.txt" paths="./..." output:crd:artifacts:config=crds
 var (
-	//go:embed crds/karpenter.k8s.aws_awsnodetemplates.yaml
-	AWSNodeTemplateCRD []byte
-	CRDs               = append(apis.CRDs, lo.Must(functional.Unmarshal[v1.CustomResourceDefinition](AWSNodeTemplateCRD)))
+	Group              = "karpenter.k8s.aws"
+	CompatibilityGroup = "compatibility." + Group
+	//go:embed crds/karpenter.k8s.aws_ec2nodeclasses.yaml
+	EC2NodeClassCRD []byte
+	//go:embed crds/karpenter.sh_nodepools.yaml
+	NodePoolCRD []byte
+	//go:embed crds/karpenter.sh_nodeclaims.yaml
+	NodeClaimCRD []byte
+	CRDs         = []*apiextensionsv1.CustomResourceDefinition{
+		object.Unmarshal[apiextensionsv1.CustomResourceDefinition](EC2NodeClassCRD),
+		object.Unmarshal[apiextensionsv1.CustomResourceDefinition](NodeClaimCRD),
+		object.Unmarshal[apiextensionsv1.CustomResourceDefinition](NodePoolCRD),
+	}
 )
-
-func init() {
-	lo.Must0(AddToScheme(scheme.Scheme))
-}

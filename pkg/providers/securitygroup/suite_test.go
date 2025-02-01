@@ -16,57 +16,49 @@ package securitygroup_test
 
 import (
 	"context"
+	"sort"
+	"sync"
 	"testing"
 
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sigs.k8s.io/karpenter/pkg/test/v1alpha1"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/service/ec2"
-	v1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/runtime/schema"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/ec2"
+	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
+	"github.com/samber/lo"
+
+	"github.com/aws/karpenter-provider-aws/pkg/apis"
+	v1 "github.com/aws/karpenter-provider-aws/pkg/apis/v1"
+	"github.com/aws/karpenter-provider-aws/pkg/operator/options"
+	"github.com/aws/karpenter-provider-aws/pkg/test"
+
+	coreoptions "sigs.k8s.io/karpenter/pkg/operator/options"
+	coretest "sigs.k8s.io/karpenter/pkg/test"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
-	. "knative.dev/pkg/logging/testing"
-
-	"github.com/aws/karpenter/pkg/apis"
-	"github.com/aws/karpenter/pkg/apis/settings"
-	"github.com/aws/karpenter/pkg/apis/v1alpha1"
-	"github.com/aws/karpenter/pkg/providers/securitygroup"
-	"github.com/aws/karpenter/pkg/test"
-
-	coresettings "github.com/aws/karpenter-core/pkg/apis/settings"
-	corev1alpha5 "github.com/aws/karpenter-core/pkg/apis/v1alpha5"
-	"github.com/aws/karpenter-core/pkg/operator/injection"
-	"github.com/aws/karpenter-core/pkg/operator/options"
-	"github.com/aws/karpenter-core/pkg/operator/scheme"
-	coretest "github.com/aws/karpenter-core/pkg/test"
-	. "github.com/aws/karpenter-core/pkg/test/expectations"
-	"github.com/aws/karpenter/pkg/fake"
+	. "sigs.k8s.io/karpenter/pkg/test/expectations"
+	. "sigs.k8s.io/karpenter/pkg/utils/testing"
 )
 
 var ctx context.Context
 var stop context.CancelFunc
-var opts options.Options
 var env *coretest.Environment
-var fakeEC2API *fake.EC2API
-var provisioner *corev1alpha5.Provisioner
-var nodeTemplate *v1alpha1.AWSNodeTemplate
-var securityGroupProvider *securitygroup.Provider
+var awsEnv *test.Environment
+var nodeClass *v1.EC2NodeClass
 
 func TestAWS(t *testing.T) {
 	ctx = TestContextWithLogger(t)
 	RegisterFailHandler(Fail)
-	RunSpecs(t, "CloudProvider/AWS")
+	RunSpecs(t, "SecurityGroupProvider")
 }
 
 var _ = BeforeSuite(func() {
-	env = coretest.NewEnvironment(scheme.Scheme, coretest.WithCRDs(apis.CRDs...))
-	ctx = coresettings.ToContext(ctx, coretest.Settings())
-	ctx = settings.ToContext(ctx, test.Settings())
+	env = coretest.NewEnvironment(coretest.WithCRDs(apis.CRDs...), coretest.WithCRDs(v1alpha1.CRDs...))
+	ctx = coreoptions.ToContext(ctx, coretest.Options())
+	ctx = options.ToContext(ctx, test.Options())
 	ctx, stop = context.WithCancel(ctx)
-	fakeEC2API = &fake.EC2API{}
-	securityGroupProvider = securitygroup.NewProvider(fakeEC2API)
+	awsEnv = test.NewEnvironment(ctx, env)
 })
 
 var _ = AfterSuite(func() {
@@ -75,123 +67,351 @@ var _ = AfterSuite(func() {
 })
 
 var _ = BeforeEach(func() {
-	ctx = injection.WithOptions(ctx, opts)
-	ctx = coresettings.ToContext(ctx, coretest.Settings())
-	ctx = settings.ToContext(ctx, test.Settings())
-	nodeTemplate = &v1alpha1.AWSNodeTemplate{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: coretest.RandomName(),
-		},
-		Spec: v1alpha1.AWSNodeTemplateSpec{
-			AWS: v1alpha1.AWS{
-				AMIFamily:             aws.String(v1alpha1.AMIFamilyAL2),
-				SubnetSelector:        map[string]string{"*": "*"},
-				SecurityGroupSelector: map[string]string{"*": "*"},
+	ctx = coreoptions.ToContext(ctx, coretest.Options())
+	ctx = options.ToContext(ctx, test.Options())
+	nodeClass = test.EC2NodeClass(v1.EC2NodeClass{
+		Spec: v1.EC2NodeClassSpec{
+			AMISelectorTerms: []v1.AMISelectorTerm{{
+				Alias: "al2@latest",
+			}},
+			SubnetSelectorTerms: []v1.SubnetSelectorTerm{
+				{
+					Tags: map[string]string{
+						"*": "*",
+					},
+				},
+			},
+			SecurityGroupSelectorTerms: []v1.SecurityGroupSelectorTerm{
+				{
+					Tags: map[string]string{
+						"*": "*",
+					},
+				},
 			},
 		},
-	}
-	nodeTemplate.SetGroupVersionKind(schema.GroupVersionKind{
-		Group:   v1alpha1.SchemeGroupVersion.Group,
-		Version: v1alpha1.SchemeGroupVersion.Version,
-		Kind:    "AWSNodeTemplate",
 	})
-	provisioner = test.Provisioner(coretest.ProvisionerOptions{
-		Requirements: []v1.NodeSelectorRequirement{{
-			Key:      v1alpha1.LabelInstanceCategory,
-			Operator: v1.NodeSelectorOpExists,
-		}},
-		ProviderRef: &corev1alpha5.ProviderRef{
-			APIVersion: nodeTemplate.APIVersion,
-			Kind:       nodeTemplate.Kind,
-			Name:       nodeTemplate.Name,
-		},
-	})
-
-	fakeEC2API.Reset()
-	securityGroupProvider.Reset()
+	awsEnv.Reset()
 })
 
 var _ = AfterEach(func() {
 	ExpectCleanedUp(ctx, env.Client)
 })
 
-var _ = Describe("Security Group Provider", func() {
+var _ = Describe("SecurityGroupProvider", func() {
 	It("should default to the clusters security groups", func() {
-		ExpectApplied(ctx, env.Client, provisioner, nodeTemplate)
-		resolvedSecurityGroups, err := securityGroupProvider.List(ctx, nodeTemplate)
+		securityGroups, err := awsEnv.SecurityGroupProvider.List(ctx, nodeClass)
 		Expect(err).To(BeNil())
-		Expect(len(resolvedSecurityGroups)).To(Equal(3))
-		Expect(resolvedSecurityGroups).To(ConsistOf(
-			"sg-test1",
-			"sg-test2",
-			"sg-test3",
-		))
+		ExpectConsistsOfSecurityGroups([]ec2types.SecurityGroup{
+			{
+				GroupId:   aws.String("sg-test1"),
+				GroupName: aws.String("securityGroup-test1"),
+			},
+			{
+				GroupId:   aws.String("sg-test2"),
+				GroupName: aws.String("securityGroup-test2"),
+			},
+			{
+				GroupId:   aws.String("sg-test3"),
+				GroupName: aws.String("securityGroup-test3"),
+			},
+		}, securityGroups)
 	})
 	It("should discover security groups by tag", func() {
-		fakeEC2API.DescribeSecurityGroupsOutput.Set(&ec2.DescribeSecurityGroupsOutput{SecurityGroups: []*ec2.SecurityGroup{
-			{GroupId: aws.String("test-sg-1"), Tags: []*ec2.Tag{{Key: aws.String("kubernetes.io/cluster/test-cluster"), Value: aws.String("test-sg-1")}}},
-			{GroupId: aws.String("test-sg-2"), Tags: []*ec2.Tag{{Key: aws.String("kubernetes.io/cluster/test-cluster"), Value: aws.String("test-sg-2")}}},
+		awsEnv.EC2API.DescribeSecurityGroupsOutput.Set(&ec2.DescribeSecurityGroupsOutput{SecurityGroups: []ec2types.SecurityGroup{
+			{GroupName: aws.String("test-sgName-1"), GroupId: aws.String("test-sg-1"), Tags: []ec2types.Tag{{Key: aws.String("kubernetes.io/cluster/test-cluster"), Value: aws.String("test-sg-1")}}},
+			{GroupName: aws.String("test-sgName-2"), GroupId: aws.String("test-sg-2"), Tags: []ec2types.Tag{{Key: aws.String("kubernetes.io/cluster/test-cluster"), Value: aws.String("test-sg-2")}}},
 		}})
-		ExpectApplied(ctx, env.Client, provisioner, nodeTemplate)
-		resolvedSecurityGroups, err := securityGroupProvider.List(ctx, nodeTemplate)
+		securityGroups, err := awsEnv.SecurityGroupProvider.List(ctx, nodeClass)
 		Expect(err).To(BeNil())
-		Expect(len(resolvedSecurityGroups)).To(Equal(2))
-		Expect(resolvedSecurityGroups).To(ConsistOf(
-			"test-sg-1",
-			"test-sg-2",
-		))
+		ExpectConsistsOfSecurityGroups([]ec2types.SecurityGroup{
+			{
+				GroupId:   aws.String("test-sg-1"),
+				GroupName: aws.String("test-sgName-1"),
+			},
+			{
+				GroupId:   aws.String("test-sg-2"),
+				GroupName: aws.String("test-sgName-2"),
+			},
+		}, securityGroups)
 	})
 	It("should discover security groups by multiple tag values", func() {
-		nodeTemplate.Spec.SecurityGroupSelector = map[string]string{"Name": "test-security-group-1,test-security-group-2"}
-		ExpectApplied(ctx, env.Client, provisioner, nodeTemplate)
-		resolvedSecurityGroups, err := securityGroupProvider.List(ctx, nodeTemplate)
+		nodeClass.Spec.SecurityGroupSelectorTerms = []v1.SecurityGroupSelectorTerm{
+			{
+				Tags: map[string]string{"Name": "test-security-group-1"},
+			},
+			{
+				Tags: map[string]string{"Name": "test-security-group-2"},
+			},
+		}
+		securityGroups, err := awsEnv.SecurityGroupProvider.List(ctx, nodeClass)
 		Expect(err).To(BeNil())
-		Expect(len(resolvedSecurityGroups)).To(Equal(2))
-		Expect(resolvedSecurityGroups).To(ConsistOf(
-			"sg-test1",
-			"sg-test2",
-		))
+		ExpectConsistsOfSecurityGroups([]ec2types.SecurityGroup{
+			{
+				GroupId:   aws.String("sg-test1"),
+				GroupName: aws.String("securityGroup-test1"),
+			},
+			{
+				GroupId:   aws.String("sg-test2"),
+				GroupName: aws.String("securityGroup-test2"),
+			},
+		}, securityGroups)
 	})
 	It("should discover security groups by ID", func() {
-		nodeTemplate.Spec.SecurityGroupSelector = map[string]string{"aws-ids": "sg-test1"}
-		ExpectApplied(ctx, env.Client, provisioner, nodeTemplate)
-		resolvedSecurityGroups, err := securityGroupProvider.List(ctx, nodeTemplate)
+		nodeClass.Spec.SecurityGroupSelectorTerms = []v1.SecurityGroupSelectorTerm{
+			{
+				ID: "sg-test1",
+			},
+		}
+		securityGroups, err := awsEnv.SecurityGroupProvider.List(ctx, nodeClass)
 		Expect(err).To(BeNil())
-		Expect(len(resolvedSecurityGroups)).To(Equal(1))
-		Expect(resolvedSecurityGroups).To(ConsistOf(
-			"sg-test1",
-		))
+		ExpectConsistsOfSecurityGroups([]ec2types.SecurityGroup{
+			{
+				GroupId:   aws.String("sg-test1"),
+				GroupName: aws.String("securityGroup-test1"),
+			},
+		}, securityGroups)
 	})
 	It("should discover security groups by IDs", func() {
-		nodeTemplate.Spec.SecurityGroupSelector = map[string]string{"aws-ids": "sg-test1,sg-test2"}
-		ExpectApplied(ctx, env.Client, provisioner, nodeTemplate)
-		resolvedSecurityGroups, err := securityGroupProvider.List(ctx, nodeTemplate)
+		nodeClass.Spec.SecurityGroupSelectorTerms = []v1.SecurityGroupSelectorTerm{
+			{
+				ID: "sg-test1",
+			},
+			{
+				ID: "sg-test2",
+			},
+		}
+		securityGroups, err := awsEnv.SecurityGroupProvider.List(ctx, nodeClass)
 		Expect(err).To(BeNil())
-		Expect(len(resolvedSecurityGroups)).To(Equal(2))
-		Expect(resolvedSecurityGroups).To(ConsistOf(
-			"sg-test1",
-			"sg-test2",
-		))
+		ExpectConsistsOfSecurityGroups([]ec2types.SecurityGroup{
+			{
+				GroupId:   aws.String("sg-test1"),
+				GroupName: aws.String("securityGroup-test1"),
+			},
+			{
+				GroupId:   aws.String("sg-test2"),
+				GroupName: aws.String("securityGroup-test2"),
+			},
+		}, securityGroups)
 	})
 	It("should discover security groups by IDs and tags", func() {
-		nodeTemplate.Spec.SecurityGroupSelector = map[string]string{"aws-ids": "sg-test1,sg-test2", "foo": "bar"}
-		ExpectApplied(ctx, env.Client, provisioner, nodeTemplate)
-		resolvedSecurityGroups, err := securityGroupProvider.List(ctx, nodeTemplate)
+		nodeClass.Spec.SecurityGroupSelectorTerms = []v1.SecurityGroupSelectorTerm{
+			{
+				ID:   "sg-test1",
+				Tags: map[string]string{"foo": "bar"},
+			},
+			{
+				ID:   "sg-test2",
+				Tags: map[string]string{"foo": "bar"},
+			},
+		}
+		securityGroups, err := awsEnv.SecurityGroupProvider.List(ctx, nodeClass)
 		Expect(err).To(BeNil())
-		Expect(len(resolvedSecurityGroups)).To(Equal(2))
-		Expect(resolvedSecurityGroups).To(ConsistOf(
-			"sg-test1",
-			"sg-test2",
-		))
+		ExpectConsistsOfSecurityGroups([]ec2types.SecurityGroup{
+			{
+				GroupId:   aws.String("sg-test1"),
+				GroupName: aws.String("securityGroup-test1"),
+			},
+			{
+				GroupId:   aws.String("sg-test2"),
+				GroupName: aws.String("securityGroup-test2"),
+			},
+		}, securityGroups)
 	})
 	It("should discover security groups by IDs intersected with tags", func() {
-		nodeTemplate.Spec.SecurityGroupSelector = map[string]string{"aws-ids": "sg-test2", "foo": "bar"}
-		ExpectApplied(ctx, env.Client, provisioner, nodeTemplate)
-		resolvedSecurityGroups, err := securityGroupProvider.List(ctx, nodeTemplate)
+		nodeClass.Spec.SecurityGroupSelectorTerms = []v1.SecurityGroupSelectorTerm{
+			{
+				ID:   "sg-test2",
+				Tags: map[string]string{"foo": "bar"},
+			},
+		}
+		securityGroups, err := awsEnv.SecurityGroupProvider.List(ctx, nodeClass)
 		Expect(err).To(BeNil())
-		Expect(len(resolvedSecurityGroups)).To(Equal(1))
-		Expect(resolvedSecurityGroups).To(ConsistOf(
-			"sg-test2",
-		))
+		ExpectConsistsOfSecurityGroups([]ec2types.SecurityGroup{
+			{
+				GroupId:   aws.String("sg-test2"),
+				GroupName: aws.String("securityGroup-test2"),
+			},
+		}, securityGroups)
+	})
+	It("should discover security groups by names", func() {
+		nodeClass.Spec.SecurityGroupSelectorTerms = []v1.SecurityGroupSelectorTerm{
+			{
+				Name: "securityGroup-test2",
+			},
+			{
+				Name: "securityGroup-test3",
+			},
+		}
+		securityGroups, err := awsEnv.SecurityGroupProvider.List(ctx, nodeClass)
+		Expect(err).To(BeNil())
+		ExpectConsistsOfSecurityGroups([]ec2types.SecurityGroup{
+			{
+				GroupId:   aws.String("sg-test2"),
+				GroupName: aws.String("securityGroup-test2"),
+			},
+			{
+				GroupId:   aws.String("sg-test3"),
+				GroupName: aws.String("securityGroup-test3"),
+			},
+		}, securityGroups)
+	})
+	It("should discover security groups by names intersected with tags", func() {
+		nodeClass.Spec.SecurityGroupSelectorTerms = []v1.SecurityGroupSelectorTerm{
+			{
+				Name: "securityGroup-test3",
+				Tags: map[string]string{"TestTag": "*"},
+			},
+		}
+		securityGroups, err := awsEnv.SecurityGroupProvider.List(ctx, nodeClass)
+		Expect(err).To(BeNil())
+		ExpectConsistsOfSecurityGroups([]ec2types.SecurityGroup{
+			{
+				GroupId:   aws.String("sg-test3"),
+				GroupName: aws.String("securityGroup-test3"),
+			},
+		}, securityGroups)
+	})
+	Context("Provider Cache", func() {
+		It("should resolve security groups from cache that are filtered by id", func() {
+			expectedSecurityGroups := awsEnv.EC2API.DescribeSecurityGroupsOutput.Clone().SecurityGroups
+			for _, sg := range expectedSecurityGroups {
+				nodeClass.Spec.SecurityGroupSelectorTerms = []v1.SecurityGroupSelectorTerm{
+					{
+						ID: *sg.GroupId,
+					},
+				}
+				// Call list to request from aws and store in the cache
+				_, err := awsEnv.SecurityGroupProvider.List(ctx, nodeClass)
+				Expect(err).To(BeNil())
+			}
+
+			for _, cachedObject := range awsEnv.SecurityGroupCache.Items() {
+				cachedSecurityGroup := cachedObject.Object.([]ec2types.SecurityGroup)
+				Expect(cachedSecurityGroup).To(HaveLen(1))
+				lo.Contains(lo.ToSlicePtr(expectedSecurityGroups), lo.ToPtr(cachedSecurityGroup[0]))
+			}
+		})
+		It("should resolve security groups from cache that are filtered by Name", func() {
+			expectedSecurityGroups := awsEnv.EC2API.DescribeSecurityGroupsOutput.Clone().SecurityGroups
+			for _, sg := range expectedSecurityGroups {
+				nodeClass.Spec.SecurityGroupSelectorTerms = []v1.SecurityGroupSelectorTerm{
+					{
+						Name: *sg.GroupName,
+					},
+				}
+				// Call list to request from aws and store in the cache
+				_, err := awsEnv.SecurityGroupProvider.List(ctx, nodeClass)
+				Expect(err).To(BeNil())
+			}
+
+			for _, cachedObject := range awsEnv.SecurityGroupCache.Items() {
+				cachedSecurityGroup := cachedObject.Object.([]ec2types.SecurityGroup)
+				Expect(cachedSecurityGroup).To(HaveLen(1))
+				lo.Contains(lo.ToSlicePtr(expectedSecurityGroups), lo.ToPtr(cachedSecurityGroup[0]))
+			}
+		})
+		It("should resolve security groups from cache that are filtered by tags", func() {
+			expectedSecurityGroups := awsEnv.EC2API.DescribeSecurityGroupsOutput.Clone().SecurityGroups
+			tagSet := lo.Map(expectedSecurityGroups, func(sg ec2types.SecurityGroup, _ int) map[string]string {
+				tag, _ := lo.Find(sg.Tags, func(tag ec2types.Tag) bool {
+					return lo.FromPtr(tag.Key) == "Name"
+				})
+				return map[string]string{"Name": lo.FromPtr(tag.Value)}
+			})
+			for _, tag := range tagSet {
+				nodeClass.Spec.SecurityGroupSelectorTerms = []v1.SecurityGroupSelectorTerm{
+					{
+						Tags: tag,
+					},
+				}
+				// Call list to request from aws and store in the cache
+				_, err := awsEnv.SecurityGroupProvider.List(ctx, nodeClass)
+				Expect(err).To(BeNil())
+			}
+
+			for _, cachedObject := range awsEnv.SubnetCache.Items() {
+				cachedSecurityGroup := cachedObject.Object.([]ec2types.SecurityGroup)
+				Expect(cachedSecurityGroup).To(HaveLen(1))
+				lo.Contains(lo.ToSlicePtr(expectedSecurityGroups), lo.ToPtr(cachedSecurityGroup[0]))
+			}
+		})
+	})
+	It("should not cause data races when calling List() simultaneously", func() {
+		wg := sync.WaitGroup{}
+		for i := 0; i < 10000; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				defer GinkgoRecover()
+				securityGroups, err := awsEnv.SecurityGroupProvider.List(ctx, nodeClass)
+				Expect(err).ToNot(HaveOccurred())
+
+				Expect(securityGroups).To(HaveLen(3))
+				// Sort everything in parallel and ensure that we don't get data races
+				sort.Slice(securityGroups, func(i, j int) bool {
+					return *securityGroups[i].GroupId < *securityGroups[j].GroupId
+				})
+				Expect(securityGroups).To(BeEquivalentTo([]ec2types.SecurityGroup{
+					{
+						GroupId:   lo.ToPtr("sg-test1"),
+						GroupName: lo.ToPtr("securityGroup-test1"),
+						Tags: []ec2types.Tag{
+							{
+								Key:   lo.ToPtr("Name"),
+								Value: lo.ToPtr("test-security-group-1"),
+							},
+							{
+								Key:   lo.ToPtr("foo"),
+								Value: lo.ToPtr("bar"),
+							},
+						},
+					},
+					{
+						GroupId:   lo.ToPtr("sg-test2"),
+						GroupName: lo.ToPtr("securityGroup-test2"),
+						Tags: []ec2types.Tag{
+							{
+								Key:   lo.ToPtr("Name"),
+								Value: lo.ToPtr("test-security-group-2"),
+							},
+							{
+								Key:   lo.ToPtr("foo"),
+								Value: lo.ToPtr("bar"),
+							},
+						},
+					},
+					{
+						GroupId:   lo.ToPtr("sg-test3"),
+						GroupName: lo.ToPtr("securityGroup-test3"),
+						Tags: []ec2types.Tag{
+							{
+								Key:   lo.ToPtr("Name"),
+								Value: lo.ToPtr("test-security-group-3"),
+							},
+							{
+								Key: lo.ToPtr("TestTag"),
+							},
+							{
+								Key:   lo.ToPtr("foo"),
+								Value: lo.ToPtr("bar"),
+							},
+						},
+					},
+				}))
+			}()
+		}
+		wg.Wait()
 	})
 })
+
+func ExpectConsistsOfSecurityGroups(expected, actual []ec2types.SecurityGroup) {
+	GinkgoHelper()
+	Expect(actual).To(HaveLen(len(expected)))
+	for _, elem := range expected {
+		_, ok := lo.Find(actual, func(s ec2types.SecurityGroup) bool {
+			return lo.FromPtr(s.GroupId) == lo.FromPtr(elem.GroupId) &&
+				lo.FromPtr(s.GroupName) == lo.FromPtr(elem.GroupName)
+		})
+		Expect(ok).To(BeTrue(), `Expected security group with {"GroupId": %q, "GroupName": %q} to exist`, lo.FromPtr(elem.GroupId), lo.FromPtr(elem.GroupName))
+	}
+}

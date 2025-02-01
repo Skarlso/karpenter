@@ -19,10 +19,12 @@ import (
 	"fmt"
 	"sync/atomic"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/service/ec2"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
+	"github.com/samber/lo"
+
 	"github.com/patrickmn/go-cache"
-	"knative.dev/pkg/logging"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 )
 
 // UnavailableOfferings stores any offerings that return ICE (insufficient capacity errors) when
@@ -35,38 +37,42 @@ type UnavailableOfferings struct {
 }
 
 func NewUnavailableOfferings() *UnavailableOfferings {
-	return &UnavailableOfferings{
-		cache:  cache.New(UnavailableOfferingsTTL, DefaultCleanupInterval),
+	uo := &UnavailableOfferings{
+		cache:  cache.New(UnavailableOfferingsTTL, UnavailableOfferingsCleanupInterval),
 		SeqNum: 0,
 	}
+	uo.cache.OnEvicted(func(_ string, _ interface{}) {
+		atomic.AddUint64(&uo.SeqNum, 1)
+	})
+	return uo
 }
 
 // IsUnavailable returns true if the offering appears in the cache
-func (u *UnavailableOfferings) IsUnavailable(instanceType, zone, capacityType string) bool {
+func (u *UnavailableOfferings) IsUnavailable(instanceType ec2types.InstanceType, zone, capacityType string) bool {
 	_, found := u.cache.Get(u.key(instanceType, zone, capacityType))
 	return found
 }
 
 // MarkUnavailable communicates recently observed temporary capacity shortages in the provided offerings
-func (u *UnavailableOfferings) MarkUnavailable(ctx context.Context, unavailableReason, instanceType, zone, capacityType string) {
+func (u *UnavailableOfferings) MarkUnavailable(ctx context.Context, unavailableReason string, instanceType ec2types.InstanceType, zone, capacityType string) {
 	// even if the key is already in the cache, we still need to call Set to extend the cached entry's TTL
-	logging.FromContext(ctx).With(
+	log.FromContext(ctx).WithValues(
 		"reason", unavailableReason,
 		"instance-type", instanceType,
 		"zone", zone,
 		"capacity-type", capacityType,
-		"ttl", UnavailableOfferingsTTL).Debugf("removing offering from offerings")
+		"ttl", UnavailableOfferingsTTL).V(1).Info("removing offering from offerings")
 	u.cache.SetDefault(u.key(instanceType, zone, capacityType), struct{}{})
 	atomic.AddUint64(&u.SeqNum, 1)
 }
 
-func (u *UnavailableOfferings) MarkUnavailableForFleetErr(ctx context.Context, fleetErr *ec2.CreateFleetError, capacityType string) {
-	instanceType := aws.StringValue(fleetErr.LaunchTemplateAndOverrides.Overrides.InstanceType)
-	zone := aws.StringValue(fleetErr.LaunchTemplateAndOverrides.Overrides.AvailabilityZone)
-	u.MarkUnavailable(ctx, aws.StringValue(fleetErr.ErrorCode), instanceType, zone, capacityType)
+func (u *UnavailableOfferings) MarkUnavailableForFleetErr(ctx context.Context, fleetErr ec2types.CreateFleetError, capacityType string) {
+	instanceType := fleetErr.LaunchTemplateAndOverrides.Overrides.InstanceType
+	zone := aws.ToString(fleetErr.LaunchTemplateAndOverrides.Overrides.AvailabilityZone)
+	u.MarkUnavailable(ctx, lo.FromPtr(fleetErr.ErrorCode), instanceType, zone, capacityType)
 }
 
-func (u *UnavailableOfferings) Delete(instanceType string, zone string, capacityType string) {
+func (u *UnavailableOfferings) Delete(instanceType ec2types.InstanceType, zone string, capacityType string) {
 	u.cache.Delete(u.key(instanceType, zone, capacityType))
 }
 
@@ -75,6 +81,6 @@ func (u *UnavailableOfferings) Flush() {
 }
 
 // key returns the cache key for all offerings in the cache
-func (u *UnavailableOfferings) key(instanceType string, zone string, capacityType string) string {
+func (u *UnavailableOfferings) key(instanceType ec2types.InstanceType, zone string, capacityType string) string {
 	return fmt.Sprintf("%s:%s:%s", capacityType, instanceType, zone)
 }

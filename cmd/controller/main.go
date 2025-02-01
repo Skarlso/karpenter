@@ -15,51 +15,59 @@ limitations under the License.
 package main
 
 import (
-	"github.com/samber/lo"
+	"github.com/aws/karpenter-provider-aws/pkg/cloudprovider"
+	"github.com/aws/karpenter-provider-aws/pkg/controllers"
+	"github.com/aws/karpenter-provider-aws/pkg/operator"
 
-	"github.com/aws/karpenter/pkg/cloudprovider"
-	"github.com/aws/karpenter/pkg/context"
-	"github.com/aws/karpenter/pkg/controllers"
-	"github.com/aws/karpenter/pkg/webhooks"
-
-	corecloudprovider "github.com/aws/karpenter-core/pkg/cloudprovider"
-	"github.com/aws/karpenter-core/pkg/cloudprovider/metrics"
-	corecontrollers "github.com/aws/karpenter-core/pkg/controllers"
-	"github.com/aws/karpenter-core/pkg/controllers/state"
-	"github.com/aws/karpenter-core/pkg/operator"
-	corewebhooks "github.com/aws/karpenter-core/pkg/webhooks"
+	"sigs.k8s.io/karpenter/pkg/cloudprovider/metrics"
+	corecontrollers "sigs.k8s.io/karpenter/pkg/controllers"
+	"sigs.k8s.io/karpenter/pkg/controllers/state"
+	coreoperator "sigs.k8s.io/karpenter/pkg/operator"
 )
 
 func main() {
-	ctx, operator := operator.NewOperator()
-	awsCtx := context.NewOrDie(corecloudprovider.Context{
-		Context:             ctx,
-		Clock:               operator.Clock,
-		RESTConfig:          operator.RESTConfig,
-		KubeClient:          operator.GetClient(),
-		KubernetesInterface: operator.KubernetesInterface,
-		EventRecorder:       operator.EventRecorder,
-		StartAsync:          operator.Elected(),
-	})
-	awsCloudProvider := cloudprovider.New(awsCtx)
-	lo.Must0(operator.AddHealthzCheck("cloud-provider", awsCloudProvider.LivenessProbe))
-	cloudProvider := metrics.Decorate(awsCloudProvider)
+	ctx, op := operator.NewOperator(coreoperator.NewOperator())
 
-	operator.
+	awsCloudProvider := cloudprovider.New(
+		op.InstanceTypesProvider,
+		op.InstanceProvider,
+		op.EventRecorder,
+		op.GetClient(),
+		op.AMIProvider,
+		op.SecurityGroupProvider,
+	)
+	cloudProvider := metrics.Decorate(awsCloudProvider)
+	clusterState := state.NewCluster(op.Clock, op.GetClient(), cloudProvider)
+
+	op.
 		WithControllers(ctx, corecontrollers.NewControllers(
 			ctx,
-			operator.Clock,
-			operator.GetClient(),
-			operator.KubernetesInterface,
-			state.NewCluster(operator.Clock, operator.GetClient(), cloudProvider),
-			operator.EventRecorder,
+			op.Manager,
+			op.Clock,
+			op.GetClient(),
+			op.EventRecorder,
 			cloudProvider,
+			clusterState,
 		)...).
-		WithWebhooks(corewebhooks.NewWebhooks()...).
 		WithControllers(ctx, controllers.NewControllers(
-			awsCtx,
-			awsCloudProvider,
+			ctx,
+			op.Manager,
+			op.Config,
+			op.Clock,
+			op.GetClient(),
+			op.EventRecorder,
+			op.UnavailableOfferingsCache,
+			op.SSMCache,
+			cloudProvider,
+			op.SubnetProvider,
+			op.SecurityGroupProvider,
+			op.InstanceProfileProvider,
+			op.InstanceProvider,
+			op.PricingProvider,
+			op.AMIProvider,
+			op.LaunchTemplateProvider,
+			op.VersionProvider,
+			op.InstanceTypesProvider,
 		)...).
-		WithWebhooks(webhooks.NewWebhooks()...).
 		Start(ctx)
 }

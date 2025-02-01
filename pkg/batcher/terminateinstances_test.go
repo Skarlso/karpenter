@@ -19,11 +19,12 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/service/ec2"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/ec2"
+	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
 
-	"github.com/aws/karpenter/pkg/batcher"
-	"github.com/aws/karpenter/pkg/fake"
+	"github.com/aws/karpenter-provider-aws/pkg/batcher"
+	"github.com/aws/karpenter-provider-aws/pkg/fake"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -40,7 +41,7 @@ var _ = Describe("TerminateInstances Batcher", func() {
 	It("should batch input into a single call", func() {
 		instanceIDs := []string{"i-1", "i-2", "i-3", "i-4", "i-5"}
 		for _, id := range instanceIDs {
-			fakeEC2API.Instances.Store(id, &ec2.Instance{})
+			fakeEC2API.Instances.Store(id, ec2types.Instance{})
 		}
 
 		var wg sync.WaitGroup
@@ -51,7 +52,35 @@ var _ = Describe("TerminateInstances Batcher", func() {
 				defer GinkgoRecover()
 				defer wg.Done()
 				rsp, err := cfb.TerminateInstances(ctx, &ec2.TerminateInstancesInput{
-					InstanceIds: []*string{aws.String(instanceID)},
+					InstanceIds: []string{instanceID},
+				})
+				Expect(err).To(BeNil())
+				atomic.AddInt64(&receivedInstance, 1)
+				Expect(rsp.TerminatingInstances).To(HaveLen(1))
+			}(instanceID)
+		}
+		wg.Wait()
+
+		Expect(receivedInstance).To(BeNumerically("==", len(instanceIDs)))
+		Expect(fakeEC2API.TerminateInstancesBehavior.CalledWithInput.Len()).To(BeNumerically("==", 1))
+		call := fakeEC2API.TerminateInstancesBehavior.CalledWithInput.Pop()
+		Expect(len(call.InstanceIds)).To(BeNumerically("==", len(instanceIDs)))
+	})
+	It("should batch input correctly when receiving multiple calls with the same instance id", func() {
+		instanceIDs := []string{"i-1", "i-1", "i-1", "i-2", "i-2"}
+		for _, id := range instanceIDs {
+			fakeEC2API.Instances.Store(id, ec2types.Instance{})
+		}
+
+		var wg sync.WaitGroup
+		var receivedInstance int64
+		for _, instanceID := range instanceIDs {
+			wg.Add(1)
+			go func(instanceID string) {
+				defer GinkgoRecover()
+				defer wg.Done()
+				rsp, err := cfb.TerminateInstances(ctx, &ec2.TerminateInstancesInput{
+					InstanceIds: []string{instanceID},
 				})
 				Expect(err).To(BeNil())
 				atomic.AddInt64(&receivedInstance, 1)
@@ -69,10 +98,10 @@ var _ = Describe("TerminateInstances Batcher", func() {
 		instanceIDs := []string{"i-1", "i-2", "i-3"}
 		// Output with only the first Terminating Instance
 		fakeEC2API.TerminateInstancesBehavior.Output.Set(&ec2.TerminateInstancesOutput{
-			TerminatingInstances: []*ec2.InstanceStateChange{
+			TerminatingInstances: []ec2types.InstanceStateChange{
 				{
-					PreviousState: &ec2.InstanceState{Name: aws.String(ec2.InstanceStateNameRunning), Code: aws.Int64(16)},
-					CurrentState:  &ec2.InstanceState{Name: aws.String(ec2.InstanceStateNameShuttingDown), Code: aws.Int64(32)},
+					PreviousState: &ec2types.InstanceState{Name: ec2types.InstanceStateNameRunning, Code: aws.Int32(16)},
+					CurrentState:  &ec2types.InstanceState{Name: ec2types.InstanceStateNameShuttingDown, Code: aws.Int32(32)},
 					InstanceId:    aws.String(instanceIDs[0]),
 				},
 			},
@@ -86,7 +115,7 @@ var _ = Describe("TerminateInstances Batcher", func() {
 				defer GinkgoRecover()
 				defer wg.Done()
 				rsp, err := cfb.TerminateInstances(ctx, &ec2.TerminateInstancesInput{
-					InstanceIds: []*string{aws.String(instanceID)},
+					InstanceIds: []string{instanceID},
 				})
 				Expect(err).To(BeNil())
 				Expect(len(rsp.TerminatingInstances)).To(BeNumerically("<=", 1))
@@ -120,7 +149,7 @@ var _ = Describe("TerminateInstances Batcher", func() {
 				defer GinkgoRecover()
 				defer wg.Done()
 				_, err := cfb.TerminateInstances(ctx, &ec2.TerminateInstancesInput{
-					InstanceIds: []*string{aws.String(instanceID)},
+					InstanceIds: []string{instanceID},
 				})
 				Expect(err).ToNot(BeNil())
 			}(instanceID)

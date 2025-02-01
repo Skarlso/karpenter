@@ -15,8 +15,13 @@ limitations under the License.
 package fake
 
 import (
-	"github.com/aws/aws-sdk-go/service/eks"
-	"github.com/aws/aws-sdk-go/service/eks/eksiface"
+	"context"
+
+	"github.com/aws/aws-sdk-go-v2/service/eks"
+	ekstypes "github.com/aws/aws-sdk-go-v2/service/eks/types"
+	"github.com/samber/lo"
+
+	sdk "github.com/aws/karpenter-provider-aws/pkg/aws"
 )
 
 const ()
@@ -24,20 +29,33 @@ const ()
 // EKSAPIBehavior must be reset between tests otherwise tests will
 // pollute each other.
 type EKSAPIBehavior struct {
-	DescribeClusterBehaviour MockedFunction[eks.DescribeClusterInput, eks.DescribeClusterOutput]
+	DescribeClusterBehavior MockedFunction[eks.DescribeClusterInput, eks.DescribeClusterOutput]
 }
 
 type EKSAPI struct {
-	eksiface.EKSAPI
+	sdk.EKSAPI
 	EKSAPIBehavior
+}
+
+func NewEKSAPI() *EKSAPI {
+	return &EKSAPI{}
 }
 
 // Reset must be called between tests otherwise tests will pollute
 // each other.
 func (s *EKSAPI) Reset() {
-	s.DescribeClusterBehaviour.Reset()
+	s.DescribeClusterBehavior.Reset()
 }
 
-func (s *EKSAPI) DescribeCluster(input *eks.DescribeClusterInput) (*eks.DescribeClusterOutput, error) {
-	return s.DescribeClusterBehaviour.Invoke(input)
+func (s *EKSAPI) DescribeCluster(_ context.Context, input *eks.DescribeClusterInput, _ ...func(*eks.Options)) (*eks.DescribeClusterOutput, error) {
+	return s.DescribeClusterBehavior.Invoke(input, func(*eks.DescribeClusterInput) (*eks.DescribeClusterOutput, error) {
+		return &eks.DescribeClusterOutput{
+			Cluster: &ekstypes.Cluster{
+				KubernetesNetworkConfig: &ekstypes.KubernetesNetworkConfigResponse{
+					ServiceIpv4Cidr: lo.ToPtr("10.100.0.0/16"),
+				},
+				Version: lo.ToPtr("1.29"),
+			},
+		}, nil
+	})
 }

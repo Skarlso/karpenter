@@ -15,17 +15,18 @@ limitations under the License.
 package fake
 
 import (
+	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/request"
-	"github.com/aws/aws-sdk-go/service/pricing"
-	"github.com/aws/aws-sdk-go/service/pricing/pricingiface"
+	"github.com/aws/aws-sdk-go-v2/service/pricing"
+
+	sdk "github.com/aws/karpenter-provider-aws/pkg/aws"
 )
 
 type PricingAPI struct {
-	pricingiface.PricingAPI
+	sdk.PricingAPI
 	PricingBehavior
 }
 type PricingBehavior struct {
@@ -38,20 +39,24 @@ func (p *PricingAPI) Reset() {
 	p.GetProductsOutput.Reset()
 }
 
-func (p *PricingAPI) GetProductsPagesWithContext(_ aws.Context, inp *pricing.GetProductsInput, fn func(*pricing.GetProductsOutput, bool) bool, opts ...request.Option) error {
+func (p *PricingAPI) GetProducts(_ context.Context, _ *pricing.GetProductsInput, _ ...func(*pricing.Options)) (*pricing.GetProductsOutput, error) {
 	if !p.NextError.IsNil() {
-		return p.NextError.Get()
+		return &pricing.GetProductsOutput{}, p.NextError.Get()
 	}
 	if !p.GetProductsOutput.IsNil() {
-		fn(p.GetProductsOutput.Clone(), false)
-		return nil
+		return p.GetProductsOutput.Clone(), nil
 	}
 	// fail if the test doesn't provide specific data which causes our pricing provider to use its static price list
-	return errors.New("no pricing data provided")
+	return &pricing.GetProductsOutput{}, errors.New("no pricing data provided")
 }
 
-func NewOnDemandPrice(instanceType string, price float64) aws.JSONValue {
-	return aws.JSONValue{
+func NewOnDemandPrice(instanceType string, price float64) string {
+	return NewOnDemandPriceWithCurrency(instanceType, price, "USD")
+
+}
+
+func NewOnDemandPriceWithCurrency(instanceType string, price float64, currency string) string {
+	data := map[string]interface{}{
 		"product": map[string]interface{}{
 			"attributes": map[string]interface{}{
 				"instanceType": instanceType,
@@ -63,11 +68,13 @@ func NewOnDemandPrice(instanceType string, price float64) aws.JSONValue {
 					"offerTermCode": "JRTCKXETXF",
 					"priceDimensions": map[string]interface{}{
 						"JRTCKXETXF.foo.bar": map[string]interface{}{
-							"pricePerUnit": map[string]interface{}{"USD": fmt.Sprintf("%f", price)},
+							"pricePerUnit": map[string]interface{}{currency: fmt.Sprintf("%f", price)},
 						},
 					},
 				},
 			},
 		},
 	}
+	ondemand, _ := json.Marshal(data)
+	return string(ondemand)
 }

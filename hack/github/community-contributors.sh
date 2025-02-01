@@ -9,7 +9,7 @@ if [ ! $# -gt 0 ]; then
         curl -s \
             -H "Accept: application/vnd.github+json" \
             -H "Authorization: token $TOKEN" \
-            https://api.github.com/repos/aws/karpenter/releases
+            https://api.github.com/repos/aws/karpenter-provider-aws/releases
     )
     LATEST=$(echo $RELEASES | jq -r ".[0].tag_name")
     PREVIOUS=$(echo $RELEASES | jq -r ".[1].tag_name")
@@ -25,7 +25,7 @@ COMMITS_PER_PAGE=500
 RESPONSE=$(
     gh api \
         -H "Accept: application/vnd.github+json" \
-        /repos/aws/karpenter/compare/$PREVIOUS...$LATEST?per_page=$COMMITS_PER_PAGE
+        /repos/aws/karpenter-provider-aws/compare/$PREVIOUS...$LATEST?per_page=$COMMITS_PER_PAGE
 )
 TOTAL_COMMITS=$(echo $RESPONSE | jq -r ".total_commits")
 PAGES=$(echo $((($TOTAL_COMMITS + $COMMITS_PER_PAGE - 1) / $COMMITS_PER_PAGE)))
@@ -35,7 +35,7 @@ for i in $(seq 1 $PAGES); do
     NEXT=$(
         gh api \
             -H "Accept: application/vnd.github+json" \
-            /repos/aws/karpenter/compare/$PREVIOUS...$LATEST?per_page=$COMMITS_PER_PAGE\&page=$i | jq -r ".commits"
+            /repos/aws/karpenter-provider-aws/compare/$PREVIOUS...$LATEST?per_page=$COMMITS_PER_PAGE\&page=$i | jq -r ".commits"
     )
     COMMITS=$(jq -s 'add' <(echo "$COMMITS") <(echo "$NEXT"))
 done
@@ -77,9 +77,13 @@ COMMUNITY_CONTRIBUTIONS=$(
         .author != "njtran" and
         .author != "dewjam" and
         .author != "suket22" and
+        .author != "Jigisha Patil" and
+        .author != "jigisha620" and
+        .author != "nikmohan123" and
         .author != "StableRelease" and
         .author != "dependabot[bot]" and
-        .author != "github-actions[bot]"
+        .author != "github-actions[bot]" and
+        .author != "APICodeGen"
     )
 ' | jq -s
 )

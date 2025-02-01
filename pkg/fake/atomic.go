@@ -130,7 +130,7 @@ func MaxCalls(maxCalls int) AtomicErrorOption {
 // AtomicPtrSlice exposes a slice of a pointer type in a race-free manner. The interface is just enough to replace the
 // set.Set usage in our previous tests.
 type AtomicPtrSlice[T any] struct {
-	mu     sync.Mutex
+	mu     sync.RWMutex
 	values []*T
 }
 
@@ -147,15 +147,24 @@ func (a *AtomicPtrSlice[T]) Add(input *T) {
 }
 
 func (a *AtomicPtrSlice[T]) Len() int {
-	a.mu.Lock()
-	defer a.mu.Unlock()
+	a.mu.RLock()
+	defer a.mu.RUnlock()
 	return len(a.values)
 }
 
 func (a *AtomicPtrSlice[T]) Pop() *T {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+
 	last := a.values[len(a.values)-1]
 	a.values = a.values[0 : len(a.values)-1]
 	return last
+}
+
+func (a *AtomicPtrSlice[T]) ForEach(fn func(*T)) {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	for _, t := range a.values {
+		fn(clone(t))
+	}
 }

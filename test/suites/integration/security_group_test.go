@@ -15,132 +15,97 @@ limitations under the License.
 package integration_test
 
 import (
-	"fmt"
-	"strings"
 	"time"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/service/ec2"
-	. "github.com/onsi/ginkgo/v2"
-	. "github.com/onsi/gomega"
+	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
+	"github.com/awslabs/operatorpkg/status"
 	"github.com/samber/lo"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	"github.com/aws/karpenter-core/pkg/apis/v1alpha5"
-	"github.com/aws/karpenter-core/pkg/test"
-	"github.com/aws/karpenter/pkg/apis/settings"
-	"github.com/aws/karpenter/pkg/apis/v1alpha1"
+	"sigs.k8s.io/karpenter/pkg/test"
 
-	awstest "github.com/aws/karpenter/pkg/test"
+	v1 "github.com/aws/karpenter-provider-aws/pkg/apis/v1"
+	"github.com/aws/karpenter-provider-aws/test/pkg/environment/aws"
+
+	. "github.com/awslabs/operatorpkg/test/expectations"
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
 )
 
 var _ = Describe("SecurityGroups", func() {
 	It("should use the security-group-id selector", func() {
-		securityGroups := env.GetSecurityGroups(map[string]string{"karpenter.sh/discovery": settings.FromContext(env.Context).ClusterName})
+		securityGroups := env.GetSecurityGroups(map[string]string{"karpenter.sh/discovery": env.ClusterName})
 		Expect(len(securityGroups)).To(BeNumerically(">", 1))
-
-		ids := strings.Join([]string{*securityGroups[0].GroupId, *securityGroups[1].GroupId}, ",")
-		provider := awstest.AWSNodeTemplate(v1alpha1.AWSNodeTemplateSpec{
-			AWS: v1alpha1.AWS{
-				SecurityGroupSelector: map[string]string{"aws-ids": ids},
-				SubnetSelector:        map[string]string{"karpenter.sh/discovery": settings.FromContext(env.Context).ClusterName},
-			},
+		nodeClass.Spec.SecurityGroupSelectorTerms = lo.Map(securityGroups, func(sg aws.SecurityGroup, _ int) v1.SecurityGroupSelectorTerm {
+			return v1.SecurityGroupSelectorTerm{
+				ID: lo.FromPtr(sg.GroupId),
+			}
 		})
-		provisioner := test.Provisioner(test.ProvisionerOptions{ProviderRef: &v1alpha5.ProviderRef{Name: provider.Name}})
 		pod := test.Pod()
 
-		env.ExpectCreated(pod, provider, provisioner)
+		env.ExpectCreated(pod, nodeClass, nodePool)
 		env.EventuallyExpectHealthy(pod)
 		env.ExpectCreatedNodeCount("==", 1)
 
-		env.ExpectInstance(pod.Spec.NodeName).To(HaveField("SecurityGroups", ConsistOf(&securityGroups[0].GroupIdentifier, &securityGroups[1].GroupIdentifier)))
+		env.ExpectInstance(pod.Spec.NodeName).To(HaveField("SecurityGroups", ConsistOf(securityGroups[0].GroupIdentifier, securityGroups[1].GroupIdentifier)))
 	})
 
 	It("should use the security group selector with multiple tag values", func() {
-		securityGroups := env.GetSecurityGroups(map[string]string{"karpenter.sh/discovery": settings.FromContext(env.Context).ClusterName})
+		securityGroups := env.GetSecurityGroups(map[string]string{"karpenter.sh/discovery": env.ClusterName})
 		Expect(len(securityGroups)).To(BeNumerically(">", 1))
 		first := securityGroups[0]
 		last := securityGroups[len(securityGroups)-1]
 
-		provider := awstest.AWSNodeTemplate(v1alpha1.AWSNodeTemplateSpec{
-			AWS: v1alpha1.AWS{
-				SecurityGroupSelector: map[string]string{"Name": fmt.Sprintf("%s,%s",
-					aws.StringValue(lo.FindOrElse(first.Tags, &ec2.Tag{}, func(tag *ec2.Tag) bool { return aws.StringValue(tag.Key) == "Name" }).Value),
-					aws.StringValue(lo.FindOrElse(last.Tags, &ec2.Tag{}, func(tag *ec2.Tag) bool { return aws.StringValue(tag.Key) == "Name" }).Value),
-				)},
-				SubnetSelector: map[string]string{"karpenter.sh/discovery": settings.FromContext(env.Context).ClusterName},
+		nodeClass.Spec.SecurityGroupSelectorTerms = []v1.SecurityGroupSelectorTerm{
+			{
+				Tags: map[string]string{"Name": lo.FromPtr(lo.FindOrElse(first.Tags, ec2types.Tag{}, func(tag ec2types.Tag) bool { return lo.FromPtr(tag.Key) == "Name" }).Value)},
 			},
-		})
-		provisioner := test.Provisioner(test.ProvisionerOptions{ProviderRef: &v1alpha5.ProviderRef{Name: provider.Name}})
+			{
+				Tags: map[string]string{"Name": lo.FromPtr(lo.FindOrElse(last.Tags, ec2types.Tag{}, func(tag ec2types.Tag) bool { return lo.FromPtr(tag.Key) == "Name" }).Value)},
+			},
+		}
 		pod := test.Pod()
 
-		env.ExpectCreated(pod, provider, provisioner)
+		env.ExpectCreated(pod, nodeClass, nodePool)
 		env.EventuallyExpectHealthy(pod)
 		env.ExpectCreatedNodeCount("==", 1)
 
-		env.ExpectInstance(pod.Spec.NodeName).To(HaveField("SecurityGroups", ConsistOf(&first.GroupIdentifier, &last.GroupIdentifier)))
+		env.ExpectInstance(pod.Spec.NodeName).To(HaveField("SecurityGroups", ConsistOf(first.GroupIdentifier, last.GroupIdentifier)))
 	})
 
-	It("should update the AWSNodeTemplateStatus for security groups", func() {
-		provider := awstest.AWSNodeTemplate(v1alpha1.AWSNodeTemplateSpec{
-			AWS: v1alpha1.AWS{
-				SecurityGroupSelector: map[string]string{"karpenter.sh/discovery": settings.FromContext(env.Context).ClusterName},
-				SubnetSelector:        map[string]string{"karpenter.sh/discovery": settings.FromContext(env.Context).ClusterName},
-			},
-		})
+	It("should update the EC2NodeClass status security groups", func() {
+		env.ExpectCreated(nodeClass)
+		EventuallyExpectSecurityGroups(env, nodeClass)
+		ExpectStatusConditions(env, env.Client, 1*time.Minute, nodeClass, status.Condition{Type: v1.ConditionTypeSecurityGroupsReady, Status: metav1.ConditionTrue})
+		ExpectStatusConditions(env, env.Client, 1*time.Minute, nodeClass, status.Condition{Type: status.ConditionReady, Status: metav1.ConditionTrue})
+	})
 
-		env.ExpectCreated(provider)
-		EventuallyExpectSecurityGroups(provider)
+	It("should have the NodeClass status as not ready since security groups were not resolved", func() {
+		nodeClass.Spec.SecurityGroupSelectorTerms = []v1.SecurityGroupSelectorTerm{
+			{
+				Tags: map[string]string{"karpenter.sh/discovery": "invalidName"},
+			},
+		}
+		env.ExpectCreated(nodeClass)
+		ExpectStatusConditions(env, env.Client, 1*time.Minute, nodeClass, status.Condition{Type: v1.ConditionTypeSecurityGroupsReady, Status: metav1.ConditionFalse, Message: "SecurityGroupSelector did not match any SecurityGroups"})
+		ExpectStatusConditions(env, env.Client, 1*time.Minute, nodeClass, status.Condition{Type: status.ConditionReady, Status: metav1.ConditionFalse, Message: "SecurityGroupsReady=False"})
 	})
 })
 
-type SecurityGroup struct {
-	ec2.GroupIdentifier
-	Tags []*ec2.Tag
-}
+func EventuallyExpectSecurityGroups(env *aws.Environment, nodeClass *v1.EC2NodeClass) {
+	securityGroups := env.GetSecurityGroups(map[string]string{"karpenter.sh/discovery": env.ClusterName})
+	Expect(securityGroups).ToNot(HaveLen(0))
 
-// getSecurityGroups returns all getSecurityGroups matching the label selector
-func getSecurityGroups(tags map[string]string) []SecurityGroup {
-	var filters []*ec2.Filter
-	for key, val := range tags {
-		filters = append(filters, &ec2.Filter{
-			Name:   aws.String(fmt.Sprintf("tag:%s", key)),
-			Values: []*string{aws.String(val)},
-		})
-	}
-	var securityGroups []SecurityGroup
-	err := env.EC2API.DescribeSecurityGroupsPages(&ec2.DescribeSecurityGroupsInput{Filters: filters}, func(dso *ec2.DescribeSecurityGroupsOutput, _ bool) bool {
-		for _, sg := range dso.SecurityGroups {
-			securityGroups = append(securityGroups, SecurityGroup{
-				Tags:            sg.Tags,
-				GroupIdentifier: ec2.GroupIdentifier{GroupId: sg.GroupId, GroupName: sg.GroupName},
-			})
-		}
-		return true
-	})
-	Expect(err).To(BeNil())
-	return securityGroups
-}
-
-func EventuallyExpectSecurityGroups(provider *v1alpha1.AWSNodeTemplate) {
-	securityGroup := getSecurityGroups(map[string]string{"karpenter.sh/discovery": settings.FromContext(env.Context).ClusterName})
-	Expect(len(securityGroup)).ToNot(Equal(0))
-	var securityGroupID []string
-
-	for _, secGroup := range securityGroup {
-		securityGroupID = append(securityGroupID, *secGroup.GroupId)
-	}
-
+	ids := sets.New(lo.Map(securityGroups, func(s aws.SecurityGroup, _ int) string {
+		return lo.FromPtr(s.GroupId)
+	})...)
 	Eventually(func(g Gomega) {
-		var ant v1alpha1.AWSNodeTemplate
-		if err := env.Client.Get(env, client.ObjectKeyFromObject(provider), &ant); err != nil {
-			return
-		}
-
-		securityGroupsInStatus := lo.Map(ant.Status.SecurityGroups, func(securitygroup v1alpha1.SecurityGroupStatus, _ int) string {
-			return securitygroup.ID
-		})
-
-		g.Expect(securityGroupsInStatus).To(Equal(securityGroupID))
+		temp := &v1.EC2NodeClass{}
+		g.Expect(env.Client.Get(env, client.ObjectKeyFromObject(nodeClass), temp)).To(Succeed())
+		g.Expect(sets.New(lo.Map(temp.Status.SecurityGroups, func(s v1.SecurityGroup, _ int) string {
+			return s.ID
+		})...).Equal(ids))
 	}).WithTimeout(10 * time.Second).Should(Succeed())
 }

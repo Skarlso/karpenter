@@ -15,27 +15,84 @@ limitations under the License.
 package controllers
 
 import (
-	"github.com/aws/aws-sdk-go/service/sqs"
-	"knative.dev/pkg/logging"
+	"context"
 
-	"github.com/aws/karpenter/pkg/apis/settings"
-	"github.com/aws/karpenter/pkg/cloudprovider"
-	awscontext "github.com/aws/karpenter/pkg/context"
-	"github.com/aws/karpenter/pkg/controllers/interruption"
-	"github.com/aws/karpenter/pkg/controllers/nodetemplate"
-	"github.com/aws/karpenter/pkg/utils/project"
+	"github.com/awslabs/operatorpkg/controller"
+	"github.com/awslabs/operatorpkg/status"
+	"github.com/patrickmn/go-cache"
+	"sigs.k8s.io/controller-runtime/pkg/manager"
+	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 
-	"github.com/aws/karpenter-core/pkg/operator/controller"
+	"github.com/aws/aws-sdk-go-v2/aws"
+
+	v1 "github.com/aws/karpenter-provider-aws/pkg/apis/v1"
+	nodeclass "github.com/aws/karpenter-provider-aws/pkg/controllers/nodeclass"
+	nodeclasshash "github.com/aws/karpenter-provider-aws/pkg/controllers/nodeclass/hash"
+	controllersinstancetype "github.com/aws/karpenter-provider-aws/pkg/controllers/providers/instancetype"
+	controllersinstancetypecapacity "github.com/aws/karpenter-provider-aws/pkg/controllers/providers/instancetype/capacity"
+	controllerspricing "github.com/aws/karpenter-provider-aws/pkg/controllers/providers/pricing"
+	ssminvalidation "github.com/aws/karpenter-provider-aws/pkg/controllers/providers/ssm/invalidation"
+	controllersversion "github.com/aws/karpenter-provider-aws/pkg/controllers/providers/version"
+	"github.com/aws/karpenter-provider-aws/pkg/providers/launchtemplate"
+	"github.com/aws/karpenter-provider-aws/pkg/providers/version"
+
+	servicesqs "github.com/aws/aws-sdk-go-v2/service/sqs"
+	"github.com/samber/lo"
+	"k8s.io/utils/clock"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	"sigs.k8s.io/karpenter/pkg/events"
+
+	awscache "github.com/aws/karpenter-provider-aws/pkg/cache"
+	"github.com/aws/karpenter-provider-aws/pkg/controllers/interruption"
+	nodeclaimgarbagecollection "github.com/aws/karpenter-provider-aws/pkg/controllers/nodeclaim/garbagecollection"
+	nodeclaimtagging "github.com/aws/karpenter-provider-aws/pkg/controllers/nodeclaim/tagging"
+	"github.com/aws/karpenter-provider-aws/pkg/operator/options"
+	"github.com/aws/karpenter-provider-aws/pkg/providers/amifamily"
+	"github.com/aws/karpenter-provider-aws/pkg/providers/instance"
+	"github.com/aws/karpenter-provider-aws/pkg/providers/instanceprofile"
+	"github.com/aws/karpenter-provider-aws/pkg/providers/instancetype"
+	"github.com/aws/karpenter-provider-aws/pkg/providers/pricing"
+	"github.com/aws/karpenter-provider-aws/pkg/providers/securitygroup"
+	"github.com/aws/karpenter-provider-aws/pkg/providers/sqs"
+	"github.com/aws/karpenter-provider-aws/pkg/providers/subnet"
 )
 
-func NewControllers(ctx awscontext.Context, cloudProvider *cloudprovider.CloudProvider) []controller.Controller {
-	logging.FromContext(ctx).With("version", project.Version).Debugf("discovered version")
-
+func NewControllers(
+	ctx context.Context,
+	mgr manager.Manager,
+	cfg aws.Config,
+	clk clock.Clock,
+	kubeClient client.Client,
+	recorder events.Recorder,
+	unavailableOfferings *awscache.UnavailableOfferings,
+	ssmCache *cache.Cache,
+	cloudProvider cloudprovider.CloudProvider,
+	subnetProvider subnet.Provider,
+	securityGroupProvider securitygroup.Provider,
+	instanceProfileProvider instanceprofile.Provider,
+	instanceProvider instance.Provider,
+	pricingProvider pricing.Provider,
+	amiProvider amifamily.Provider,
+	launchTemplateProvider launchtemplate.Provider,
+	versionProvider *version.DefaultProvider,
+	instanceTypeProvider *instancetype.DefaultProvider) []controller.Controller {
 	controllers := []controller.Controller{
-		nodetemplate.NewController(ctx.KubeClient, ctx.SubnetProvider, ctx.SecurityGroupProvider),
+		nodeclasshash.NewController(kubeClient),
+		nodeclass.NewController(kubeClient, recorder, subnetProvider, securityGroupProvider, amiProvider, instanceProfileProvider, launchTemplateProvider),
+		nodeclaimgarbagecollection.NewController(kubeClient, cloudProvider),
+		nodeclaimtagging.NewController(kubeClient, cloudProvider, instanceProvider),
+		controllerspricing.NewController(pricingProvider),
+		controllersinstancetype.NewController(instanceTypeProvider),
+		controllersinstancetypecapacity.NewController(kubeClient, cloudProvider, instanceTypeProvider),
+		ssminvalidation.NewController(ssmCache, amiProvider),
+		status.NewController[*v1.EC2NodeClass](kubeClient, mgr.GetEventRecorderFor("karpenter"), status.EmitDeprecatedMetrics),
+		controllersversion.NewController(versionProvider, versionProvider.UpdateVersionWithValidation),
 	}
-	if settings.FromContext(ctx).InterruptionQueueName != "" {
-		controllers = append(controllers, interruption.NewController(ctx.KubeClient, ctx.Clock, ctx.EventRecorder, interruption.NewSQSProvider(sqs.New(ctx.Session)), ctx.UnavailableOfferingsCache))
+	if options.FromContext(ctx).InterruptionQueue != "" {
+		sqsapi := servicesqs.NewFromConfig(cfg)
+		out := lo.Must(sqsapi.GetQueueUrl(ctx, &servicesqs.GetQueueUrlInput{QueueName: lo.ToPtr(options.FromContext(ctx).InterruptionQueue)}))
+		controllers = append(controllers, interruption.NewController(kubeClient, cloudProvider, clk, recorder, lo.Must(sqs.NewDefaultProvider(sqsapi, lo.FromPtr(out.QueueUrl))), unavailableOfferings))
 	}
 	return controllers
 }
