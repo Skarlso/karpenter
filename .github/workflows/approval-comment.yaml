@@ -2,23 +2,24 @@ name: ApprovalComment
 on:
   pull_request_review:
     types: [submitted]
-
 jobs:
   approval-comment:
-    if: startsWith(github.event.review.body ,'/karpenter snapshot')
-    permissions: write-all
+    if: startsWith(github.event.review.body, '/karpenter snapshot') || startsWith(github.event.review.body, '/karpenter scale') || startsWith(github.event.review.body, '/karpenter versionCompatibility')
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@9bb56186c3b09b4f86b1c65136769dd318469633 # v4.1.2
         with:
           fetch-depth: 0
-      - uses: ./.github/actions/maintainer-check
-        with:
-          username: ${{ github.event.review.user.login }}
       - name: Save info about the review comment as an artifact for other workflows that run on workflow_run to download them
+        env:
+          REVIEW_BODY: ${{ github.event.review.body }}
+          PULL_REQUEST_NUMBER: ${{ github.event.pull_request.number }}
+          COMMIT_ID: ${{ github.event.review.commit_id }}
         run: |
           mkdir -p /tmp/artifacts
-          echo ${{ github.event.pull_request.number }} >> /tmp/artifacts/metadata.txt
-          echo ${{ github.event.review.commit_id }} >> /tmp/artifacts/metadata.txt
+          { echo "$REVIEW_BODY"; echo "$PULL_REQUEST_NUMBER"; echo "$COMMIT_ID"; } >> /tmp/artifacts/metadata.txt
           cat /tmp/artifacts/metadata.txt
-      - uses: ./.github/actions/upload-artifact
+      - uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4.6.0
+        with:
+          name: artifacts
+          path: /tmp/artifacts

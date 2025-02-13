@@ -15,46 +15,32 @@ limitations under the License.
 package aws
 
 import (
-	"fmt"
-
-	//nolint:revive,stylecheck
-	v1 "k8s.io/api/core/v1"
+	corev1 "k8s.io/api/core/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	"github.com/aws/karpenter-core/pkg/utils/functional"
-	"github.com/aws/karpenter/pkg/apis/v1alpha1"
-	"github.com/aws/karpenter/test/pkg/environment/common"
+	v1 "github.com/aws/karpenter-provider-aws/pkg/apis/v1"
 )
 
-var persistedSettings *v1.ConfigMap
+var persistedSettings []corev1.EnvVar
 
 var (
-	CleanableObjects = []functional.Pair[client.Object, client.ObjectList]{
-		{First: &v1alpha1.AWSNodeTemplate{}, Second: &v1alpha1.AWSNodeTemplateList{}},
+	CleanableObjects = []client.Object{
+		&v1.EC2NodeClass{},
 	}
 )
 
-func (env *Environment) BeforeEach(opts ...common.Option) {
+func (env *Environment) BeforeEach() {
 	persistedSettings = env.ExpectSettings()
-	env.Environment.BeforeEach(opts...)
+	env.Environment.BeforeEach()
 }
 
-func (env *Environment) Cleanup(opts ...common.Option) {
-	options := common.ResolveOptions(opts)
-	if !options.DisableDebug {
-		fmt.Println("------- START AWS CLEANUP -------")
-		defer fmt.Println("------- END AWS CLEANUP -------")
-	}
-	env.Environment.CleanupObjects(CleanableObjects)
-	env.Environment.Cleanup(opts...)
+func (env *Environment) Cleanup() {
+	env.Environment.Cleanup()
+	env.Environment.CleanupObjects(CleanableObjects...)
 }
 
-func (env *Environment) ForceCleanup(opts ...common.Option) {
-	env.Environment.ForceCleanup(opts...)
-}
-
-func (env *Environment) AfterEach(opts ...common.Option) {
-	env.Environment.AfterEach(opts...)
+func (env *Environment) AfterEach() {
+	env.Environment.AfterEach()
 	// Ensure we reset settings after collecting the controller logs
-	env.ExpectSettingsOverridden(persistedSettings.Data)
+	env.ExpectSettingsReplaced(persistedSettings...)
 }

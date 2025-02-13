@@ -16,7 +16,18 @@ package utils
 
 import (
 	"fmt"
+	"os"
 	"regexp"
+	"strconv"
+	"strings"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
+	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
+
+	v1 "github.com/aws/karpenter-provider-aws/pkg/apis/v1"
+
+	"github.com/samber/lo"
 )
 
 var (
@@ -36,4 +47,62 @@ func ParseInstanceID(providerID string) (string, error) {
 		}
 	}
 	return "", fmt.Errorf("parsing instance id %s", providerID)
+}
+
+// MergeTags takes a variadic list of maps and merges them together into a list of
+// EC2 tags to be passed into EC2 API calls
+func MergeTags(tags ...map[string]string) []ec2types.Tag {
+	return lo.MapToSlice(lo.Assign(tags...), func(k, v string) ec2types.Tag {
+		return ec2types.Tag{Key: aws.String(k), Value: aws.String(v)}
+	})
+}
+
+// PrettySlice truncates a slice after a certain number of max items to ensure
+// that the Slice isn't too long
+func PrettySlice[T any](s []T, maxItems int) string {
+	var sb strings.Builder
+	for i, elem := range s {
+		if i > maxItems-1 {
+			fmt.Fprintf(&sb, " and %d other(s)", len(s)-i)
+			break
+		} else if i > 0 {
+			fmt.Fprint(&sb, ", ")
+		}
+		fmt.Fprint(&sb, elem)
+	}
+	return sb.String()
+}
+
+// WithDefaultFloat64 returns the float64 value of the supplied environment variable or, if not present,
+// the supplied default value. If the float64 conversion fails, returns the default
+func WithDefaultFloat64(key string, def float64) float64 {
+	val, ok := os.LookupEnv(key)
+	if !ok {
+		return def
+	}
+	f, err := strconv.ParseFloat(val, 64)
+	if err != nil {
+		return def
+	}
+	return f
+}
+
+func GetTags(nodeClass *v1.EC2NodeClass, nodeClaim *karpv1.NodeClaim, clusterName string) (map[string]string, error) {
+	if offendingTag, found := lo.FindKeyBy(nodeClass.Spec.Tags, func(k string, v string) bool {
+		for _, exp := range v1.RestrictedTagPatterns {
+			if exp.MatchString(k) {
+				return true
+			}
+		}
+		return false
+	}); found {
+		return nil, fmt.Errorf("%q tag does not pass tag validation requirements", offendingTag)
+	}
+	staticTags := map[string]string{
+		fmt.Sprintf("kubernetes.io/cluster/%s", clusterName): "owned",
+		karpv1.NodePoolLabelKey:                              nodeClaim.Labels[karpv1.NodePoolLabelKey],
+		v1.EKSClusterNameTagKey:                              clusterName,
+		v1.LabelNodeClass:                                    nodeClass.Name,
+	}
+	return lo.Assign(nodeClass.Spec.Tags, staticTags), nil
 }

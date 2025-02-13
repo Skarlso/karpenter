@@ -17,13 +17,18 @@ package integration_test
 import (
 	"testing"
 
+	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
+
+	v1 "github.com/aws/karpenter-provider-aws/pkg/apis/v1"
+	"github.com/aws/karpenter-provider-aws/test/pkg/environment/aws"
+
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
-
-	"github.com/aws/karpenter/test/pkg/environment/aws"
 )
 
 var env *aws.Environment
+var nodeClass *v1.EC2NodeClass
+var nodePool *karpv1.NodePool
 
 func TestIntegration(t *testing.T) {
 	RegisterFailHandler(Fail)
@@ -36,7 +41,10 @@ func TestIntegration(t *testing.T) {
 	RunSpecs(t, "Integration")
 }
 
-var _ = BeforeEach(func() { env.BeforeEach() })
+var _ = BeforeEach(func() {
+	env.BeforeEach()
+	nodeClass = env.DefaultEC2NodeClass()
+	nodePool = env.DefaultNodePool(nodeClass)
+})
 var _ = AfterEach(func() { env.Cleanup() })
-var _ = AfterEach(func() { env.ForceCleanup() })
 var _ = AfterEach(func() { env.AfterEach() })

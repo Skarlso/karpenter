@@ -15,57 +15,48 @@ limitations under the License.
 package interruption
 
 import (
+	opmetrics "github.com/awslabs/operatorpkg/metrics"
 	"github.com/prometheus/client_golang/prometheus"
 	crmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
-	"github.com/aws/karpenter-core/pkg/metrics"
+	"sigs.k8s.io/karpenter/pkg/metrics"
 )
 
 const (
-	interruptionSubsystem  = "interruption"
-	messageTypeLabel       = "message_type"
-	actionTypeLabel        = "action_type"
-	terminationReasonLabel = "interruption"
+	interruptionSubsystem = "interruption"
+	messageTypeLabel      = "message_type"
 )
 
 var (
-	receivedMessages = prometheus.NewCounterVec(
+	ReceivedMessages = opmetrics.NewPrometheusCounter(
+		crmetrics.Registry,
 		prometheus.CounterOpts{
 			Namespace: metrics.Namespace,
 			Subsystem: interruptionSubsystem,
-			Name:      "received_messages",
+			Name:      "received_messages_total",
 			Help:      "Count of messages received from the SQS queue. Broken down by message type and whether the message was actionable.",
 		},
 		[]string{messageTypeLabel},
 	)
-	deletedMessages = prometheus.NewCounter(
+	DeletedMessages = opmetrics.NewPrometheusCounter(
+		crmetrics.Registry,
 		prometheus.CounterOpts{
 			Namespace: metrics.Namespace,
 			Subsystem: interruptionSubsystem,
-			Name:      "deleted_messages",
+			Name:      "deleted_messages_total",
 			Help:      "Count of messages deleted from the SQS queue.",
 		},
+		[]string{},
 	)
-	messageLatency = prometheus.NewHistogram(
+	MessageLatency = opmetrics.NewPrometheusHistogram(
+		crmetrics.Registry,
 		prometheus.HistogramOpts{
 			Namespace: metrics.Namespace,
 			Subsystem: interruptionSubsystem,
-			Name:      "message_latency_time_seconds",
-			Help:      "Length of time between message creation in queue and an action taken on the message by the controller.",
+			Name:      "message_queue_duration_seconds",
+			Help:      "Amount of time an interruption message is on the queue before it is processed by karpenter.",
 			Buckets:   metrics.DurationBuckets(),
 		},
-	)
-	actionsPerformed = prometheus.NewCounterVec(
-		prometheus.CounterOpts{
-			Namespace: metrics.Namespace,
-			Subsystem: interruptionSubsystem,
-			Name:      "actions_performed",
-			Help:      "Number of notification actions performed. Labeled by action",
-		},
-		[]string{actionTypeLabel},
+		[]string{},
 	)
 )
-
-func init() {
-	crmetrics.Registry.MustRegister(receivedMessages, deletedMessages, messageLatency, actionsPerformed)
-}

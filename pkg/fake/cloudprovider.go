@@ -17,16 +17,20 @@ package fake
 import (
 	"context"
 
+	"github.com/awslabs/operatorpkg/status"
+
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	"github.com/aws/karpenter-core/pkg/apis/v1alpha5"
-	corecloudprovider "github.com/aws/karpenter-core/pkg/cloudprovider"
-	"github.com/aws/karpenter-core/pkg/test"
-	"github.com/aws/karpenter/pkg/apis/v1alpha1"
+	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
+	corecloudprovider "sigs.k8s.io/karpenter/pkg/cloudprovider"
+	"sigs.k8s.io/karpenter/pkg/test"
+
+	v1 "github.com/aws/karpenter-provider-aws/pkg/apis/v1"
 )
 
 const (
-	defaultRegion = "us-west-2"
+	DefaultRegion  = "us-west-2"
+	DefaultAccount = "123456789"
 )
 
 var _ corecloudprovider.CloudProvider = (*CloudProvider)(nil)
@@ -36,19 +40,19 @@ type CloudProvider struct {
 	ValidAMIs     []string
 }
 
-func (c *CloudProvider) Create(_ context.Context, _ *v1alpha5.Machine) (*v1alpha5.Machine, error) {
+func (c *CloudProvider) Create(_ context.Context, _ *karpv1.NodeClaim) (*karpv1.NodeClaim, error) {
 	name := test.RandomName()
-	return &v1alpha5.Machine{
+	return &karpv1.NodeClaim{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: name,
 		},
-		Status: v1alpha5.MachineStatus{
+		Status: karpv1.NodeClaimStatus{
 			ProviderID: RandomProviderID(),
 		},
 	}, nil
 }
 
-func (c *CloudProvider) GetInstanceTypes(_ context.Context, _ *v1alpha5.Provisioner) ([]*corecloudprovider.InstanceType, error) {
+func (c *CloudProvider) GetInstanceTypes(_ context.Context, _ *karpv1.NodePool) ([]*corecloudprovider.InstanceType, error) {
 	if c.InstanceTypes != nil {
 		return c.InstanceTypes, nil
 	}
@@ -57,25 +61,35 @@ func (c *CloudProvider) GetInstanceTypes(_ context.Context, _ *v1alpha5.Provisio
 	}, nil
 }
 
-func (c *CloudProvider) IsMachineDrifted(_ context.Context, machine *v1alpha5.Machine) (bool, error) {
-	nodeAMI := machine.Labels[v1alpha1.LabelInstanceAMIID]
-	for _, ami := range c.ValidAMIs {
-		if nodeAMI == ami {
-			return false, nil
-		}
-	}
-	return true, nil
+func (c *CloudProvider) IsDrifted(_ context.Context, nodeClaim *karpv1.NodeClaim) (corecloudprovider.DriftReason, error) {
+	return "drifted", nil
 }
 
-func (c *CloudProvider) Get(context.Context, string) (*v1alpha5.Machine, error) {
+func (c *CloudProvider) Get(context.Context, string) (*karpv1.NodeClaim, error) {
 	return nil, nil
 }
 
-func (c *CloudProvider) Delete(context.Context, *v1alpha5.Machine) error {
+func (c *CloudProvider) List(context.Context) ([]*karpv1.NodeClaim, error) {
+	return nil, nil
+}
+
+func (c *CloudProvider) Delete(context.Context, *karpv1.NodeClaim) error {
+	return nil
+}
+
+func (c *CloudProvider) DisruptionReasons() []karpv1.DisruptionReason {
 	return nil
 }
 
 // Name returns the CloudProvider implementation name.
 func (c *CloudProvider) Name() string {
 	return "fake"
+}
+
+func (c *CloudProvider) GetSupportedNodeClasses() []status.Object {
+	return []status.Object{&v1.EC2NodeClass{}}
+}
+
+func (c *CloudProvider) RepairPolicies() []corecloudprovider.RepairPolicy {
+	return []corecloudprovider.RepairPolicy{}
 }

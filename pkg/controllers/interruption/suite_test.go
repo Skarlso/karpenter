@@ -21,53 +21,57 @@ import (
 	"testing"
 	"time"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/awserr"
-	"github.com/aws/aws-sdk-go/service/sqs"
-	. "github.com/onsi/ginkgo/v2"
-	. "github.com/onsi/gomega"
+	"sigs.k8s.io/karpenter/pkg/metrics"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	servicesqs "github.com/aws/aws-sdk-go-v2/service/sqs"
+	sqstypes "github.com/aws/aws-sdk-go-v2/service/sqs/types"
+	"github.com/aws/smithy-go"
 	"github.com/samber/lo"
-	v1 "k8s.io/api/core/v1"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/uuid"
 	"k8s.io/client-go/tools/record"
 	clock "k8s.io/utils/clock/testing"
-	. "knative.dev/pkg/logging/testing"
-	_ "knative.dev/pkg/system/testing"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	coresettings "github.com/aws/karpenter-core/pkg/apis/settings"
-	"github.com/aws/karpenter-core/pkg/apis/v1alpha5"
-	"github.com/aws/karpenter-core/pkg/events"
-	"github.com/aws/karpenter-core/pkg/operator/scheme"
-	coretest "github.com/aws/karpenter-core/pkg/test"
-	. "github.com/aws/karpenter-core/pkg/test/expectations"
-	"github.com/aws/karpenter/pkg/apis"
-	"github.com/aws/karpenter/pkg/apis/settings"
-	"github.com/aws/karpenter/pkg/apis/v1alpha1"
-	awscache "github.com/aws/karpenter/pkg/cache"
-	"github.com/aws/karpenter/pkg/controllers/interruption"
-	"github.com/aws/karpenter/pkg/controllers/interruption/messages"
-	"github.com/aws/karpenter/pkg/controllers/interruption/messages/scheduledchange"
-	"github.com/aws/karpenter/pkg/controllers/interruption/messages/spotinterruption"
-	"github.com/aws/karpenter/pkg/controllers/interruption/messages/statechange"
-	"github.com/aws/karpenter/pkg/fake"
-	"github.com/aws/karpenter/pkg/test"
+	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
+	"sigs.k8s.io/karpenter/pkg/events"
+	coreoptions "sigs.k8s.io/karpenter/pkg/operator/options"
+	coretest "sigs.k8s.io/karpenter/pkg/test"
+
+	"github.com/aws/karpenter-provider-aws/pkg/apis"
+	awscache "github.com/aws/karpenter-provider-aws/pkg/cache"
+	"github.com/aws/karpenter-provider-aws/pkg/cloudprovider"
+	"github.com/aws/karpenter-provider-aws/pkg/controllers/interruption"
+	"github.com/aws/karpenter-provider-aws/pkg/controllers/interruption/messages"
+	"github.com/aws/karpenter-provider-aws/pkg/controllers/interruption/messages/scheduledchange"
+	"github.com/aws/karpenter-provider-aws/pkg/controllers/interruption/messages/spotinterruption"
+	"github.com/aws/karpenter-provider-aws/pkg/controllers/interruption/messages/statechange"
+	"github.com/aws/karpenter-provider-aws/pkg/fake"
+	"github.com/aws/karpenter-provider-aws/pkg/operator/options"
+	"github.com/aws/karpenter-provider-aws/pkg/providers/sqs"
+	"github.com/aws/karpenter-provider-aws/pkg/test"
+	"github.com/aws/karpenter-provider-aws/pkg/utils"
+
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
+	. "sigs.k8s.io/karpenter/pkg/test/expectations"
+	"sigs.k8s.io/karpenter/pkg/test/v1alpha1"
+	. "sigs.k8s.io/karpenter/pkg/utils/testing"
 )
 
 const (
-	defaultAccountID  = "000000000000"
-	defaultInstanceID = "i-08c6fdb11e28c8c90"
-	defaultRegion     = "us-west-2"
-	ec2Source         = "aws.ec2"
-	healthSource      = "aws.health"
+	defaultAccountID = "000000000000"
+	ec2Source        = "aws.ec2"
+	healthSource     = "aws.health"
 )
 
 var ctx context.Context
+var awsEnv *test.Environment
 var env *coretest.Environment
 var sqsapi *fake.SQSAPI
-var sqsProvider *interruption.SQSProvider
+var sqsProvider *sqs.DefaultProvider
 var unavailableOfferingsCache *awscache.UnavailableOfferings
 var fakeClock *clock.FakeClock
 var controller *interruption.Controller
@@ -79,12 +83,16 @@ func TestAPIs(t *testing.T) {
 }
 
 var _ = BeforeSuite(func() {
-	env = coretest.NewEnvironment(scheme.Scheme, coretest.WithCRDs(apis.CRDs...))
+	ctx = options.ToContext(ctx, test.Options())
+	env = coretest.NewEnvironment(coretest.WithCRDs(apis.CRDs...), coretest.WithCRDs(v1alpha1.CRDs...), coretest.WithFieldIndexers(test.NodeInstanceIDFieldIndexer(ctx), test.NodeClaimInstanceIDFieldIndexer(ctx)))
+	awsEnv = test.NewEnvironment(ctx, env)
 	fakeClock = &clock.FakeClock{}
 	unavailableOfferingsCache = awscache.NewUnavailableOfferings()
 	sqsapi = &fake.SQSAPI{}
-	sqsProvider = interruption.NewSQSProvider(sqsapi)
-	controller = interruption.NewController(env.Client, fakeClock, events.NewRecorder(&record.FakeRecorder{}), sqsProvider, unavailableOfferingsCache)
+	sqsProvider = lo.Must(sqs.NewDefaultProvider(sqsapi, fmt.Sprintf("https://sqs.%s.amazonaws.com/%s/test-cluster", fake.DefaultRegion, fake.DefaultAccount)))
+	cloudProvider := cloudprovider.New(awsEnv.InstanceTypesProvider, awsEnv.InstanceProvider, events.NewRecorder(&record.FakeRecorder{}),
+		env.Client, awsEnv.AMIProvider, awsEnv.SecurityGroupProvider)
+	controller = interruption.NewController(env.Client, cloudProvider, fakeClock, events.NewRecorder(&record.FakeRecorder{}), sqsProvider, unavailableOfferingsCache)
 })
 
 var _ = AfterSuite(func() {
@@ -92,94 +100,109 @@ var _ = AfterSuite(func() {
 })
 
 var _ = BeforeEach(func() {
-	sqsProvider = interruption.NewSQSProvider(sqsapi)
-	controller = interruption.NewController(env.Client, fakeClock, events.NewRecorder(&record.FakeRecorder{}), sqsProvider, unavailableOfferingsCache)
-	ctx = coresettings.ToContext(ctx, coretest.Settings())
-	ctx = settings.ToContext(ctx, test.Settings(test.SettingOptions{
-		InterruptionQueueName: lo.ToPtr("test-cluster"),
-	}))
+	ctx = coreoptions.ToContext(ctx, coretest.Options())
 	unavailableOfferingsCache.Flush()
 	sqsapi.Reset()
-	sqsProvider.Reset()
 })
 
 var _ = AfterEach(func() {
 	ExpectCleanedUp(ctx, env.Client)
 })
 
-var _ = Describe("AWSInterruption", func() {
+var _ = Describe("InterruptionHandling", func() {
+	var node *corev1.Node
+	var nodeClaim *karpv1.NodeClaim
+	BeforeEach(func() {
+		nodeClaim, node = coretest.NodeClaimAndNode(karpv1.NodeClaim{
+			ObjectMeta: metav1.ObjectMeta{
+				Labels: map[string]string{
+					karpv1.NodePoolLabelKey: "default",
+				},
+			},
+			Status: karpv1.NodeClaimStatus{
+				ProviderID: fake.RandomProviderID(),
+			},
+		})
+		metrics.NodeClaimsDisruptedTotal.Reset()
+	})
 	Context("Processing Messages", func() {
-		It("should delete the node when receiving a spot interruption warning", func() {
-			node := coretest.Node(coretest.NodeOptions{
-				ObjectMeta: metav1.ObjectMeta{
-					Labels: map[string]string{
-						v1alpha5.ProvisionerNameLabelKey: "default",
-					},
-				},
-				ProviderID: fake.ProviderID(defaultInstanceID),
-			})
-			ExpectMessagesCreated(spotInterruptionMessage(defaultInstanceID))
-			ExpectApplied(ctx, env.Client, node)
+		It("should delete the NodeClaim when receiving a spot interruption warning", func() {
+			ExpectMessagesCreated(spotInterruptionMessage(lo.Must(utils.ParseInstanceID(nodeClaim.Status.ProviderID))))
+			ExpectApplied(ctx, env.Client, nodeClaim, node)
 
-			ExpectReconcileSucceeded(ctx, controller, types.NamespacedName{})
+			ExpectSingletonReconciled(ctx, controller)
+			ExpectMetricCounterValue(metrics.NodeClaimsDisruptedTotal, 1, map[string]string{
+				metrics.ReasonLabel: "spot_interrupted",
+				"nodepool":          "default",
+			})
 			Expect(sqsapi.ReceiveMessageBehavior.SuccessfulCalls()).To(Equal(1))
-			ExpectNotFound(ctx, env.Client, node)
+			ExpectNotFound(ctx, env.Client, nodeClaim)
 			Expect(sqsapi.DeleteMessageBehavior.SuccessfulCalls()).To(Equal(1))
 		})
-		It("should delete the node when receiving a scheduled change message", func() {
-			node := coretest.Node(coretest.NodeOptions{
-				ObjectMeta: metav1.ObjectMeta{
-					Labels: map[string]string{
-						v1alpha5.ProvisionerNameLabelKey: "default",
-					},
-				},
-				ProviderID: fake.ProviderID(defaultInstanceID),
-			})
-			ExpectMessagesCreated(scheduledChangeMessage(defaultInstanceID))
-			ExpectApplied(ctx, env.Client, node)
+		It("should delete the NodeClaim when receiving a scheduled change message", func() {
+			ExpectMessagesCreated(scheduledChangeMessage(lo.Must(utils.ParseInstanceID(nodeClaim.Status.ProviderID))))
+			ExpectApplied(ctx, env.Client, nodeClaim, node)
 
-			ExpectReconcileSucceeded(ctx, controller, types.NamespacedName{})
+			ExpectSingletonReconciled(ctx, controller)
+			ExpectMetricCounterValue(metrics.NodeClaimsDisruptedTotal, 1, map[string]string{
+				metrics.ReasonLabel: "scheduled_change",
+				"nodepool":          "default",
+			})
 			Expect(sqsapi.ReceiveMessageBehavior.SuccessfulCalls()).To(Equal(1))
-			ExpectNotFound(ctx, env.Client, node)
+			ExpectNotFound(ctx, env.Client, nodeClaim)
 			Expect(sqsapi.DeleteMessageBehavior.SuccessfulCalls()).To(Equal(1))
 		})
-		It("should delete the node when receiving a state change message", func() {
-			var nodes []*v1.Node
+		It("should delete the NodeClaim when receiving a state change message", func() {
+			var nodeClaims []*karpv1.NodeClaim
 			var messages []interface{}
 			for _, state := range []string{"terminated", "stopped", "stopping", "shutting-down"} {
 				instanceID := fake.InstanceID()
-				nodes = append(nodes, coretest.Node(coretest.NodeOptions{
+				nc, n := coretest.NodeClaimAndNode(karpv1.NodeClaim{
 					ObjectMeta: metav1.ObjectMeta{
 						Labels: map[string]string{
-							v1alpha5.ProvisionerNameLabelKey: "default",
+							karpv1.NodePoolLabelKey: "default",
 						},
 					},
-					ProviderID: fake.ProviderID(instanceID),
-				}))
+					Status: karpv1.NodeClaimStatus{
+						ProviderID: fake.ProviderID(instanceID),
+					},
+				})
+				ExpectApplied(ctx, env.Client, nc, n)
+				nodeClaims = append(nodeClaims, nc)
 				messages = append(messages, stateChangeMessage(instanceID, state))
 			}
 			ExpectMessagesCreated(messages...)
-			ExpectApplied(ctx, env.Client, lo.Map(nodes, func(n *v1.Node, _ int) client.Object { return n })...)
-
-			ExpectReconcileSucceeded(ctx, controller, types.NamespacedName{})
+			ExpectSingletonReconciled(ctx, controller)
+			ExpectMetricCounterValue(metrics.NodeClaimsDisruptedTotal, 2, map[string]string{
+				metrics.ReasonLabel: "instance_terminated",
+				"nodepool":          "default",
+			})
+			ExpectMetricCounterValue(metrics.NodeClaimsDisruptedTotal, 2, map[string]string{
+				metrics.ReasonLabel: "instance_stopped",
+				"nodepool":          "default",
+			})
 			Expect(sqsapi.ReceiveMessageBehavior.SuccessfulCalls()).To(Equal(1))
-			ExpectNotFound(ctx, env.Client, lo.Map(nodes, func(n *v1.Node, _ int) client.Object { return n })...)
+			ExpectNotFound(ctx, env.Client, lo.Map(nodeClaims, func(nc *karpv1.NodeClaim, _ int) client.Object { return nc })...)
 			Expect(sqsapi.DeleteMessageBehavior.SuccessfulCalls()).To(Equal(4))
 		})
-		It("should handle multiple messages that cause node deletion", func() {
-			var nodes []*v1.Node
+		It("should handle multiple messages that cause nodeClaim deletion", func() {
+			var nodeClaims []*karpv1.NodeClaim
 			var instanceIDs []string
 			for i := 0; i < 100; i++ {
-				instanceIDs = append(instanceIDs, fake.InstanceID())
-				nodes = append(nodes, coretest.Node(coretest.NodeOptions{
+				instanceID := fake.InstanceID()
+				nc, n := coretest.NodeClaimAndNode(karpv1.NodeClaim{
 					ObjectMeta: metav1.ObjectMeta{
 						Labels: map[string]string{
-							v1alpha5.ProvisionerNameLabelKey: "default",
+							karpv1.NodePoolLabelKey: "default",
 						},
 					},
-					ProviderID: fake.ProviderID(instanceIDs[len(instanceIDs)-1]),
-				}))
-
+					Status: karpv1.NodeClaimStatus{
+						ProviderID: fake.ProviderID(instanceID),
+					},
+				})
+				ExpectApplied(ctx, env.Client, nc, n)
+				instanceIDs = append(instanceIDs, instanceID)
+				nodeClaims = append(nodeClaims, nc)
 			}
 
 			var messages []interface{}
@@ -187,27 +210,13 @@ var _ = Describe("AWSInterruption", func() {
 				messages = append(messages, spotInterruptionMessage(id))
 			}
 			ExpectMessagesCreated(messages...)
-			ExpectApplied(ctx, env.Client, lo.Map(nodes, func(n *v1.Node, _ int) client.Object { return n })...)
-
-			ExpectReconcileSucceeded(ctx, controller, types.NamespacedName{})
+			ExpectSingletonReconciled(ctx, controller)
 			Expect(sqsapi.ReceiveMessageBehavior.SuccessfulCalls()).To(Equal(1))
-			ExpectNotFound(ctx, env.Client, lo.Map(nodes, func(n *v1.Node, _ int) client.Object { return n })...)
+			ExpectNotFound(ctx, env.Client, lo.Map(nodeClaims, func(nc *karpv1.NodeClaim, _ int) client.Object { return nc })...)
 			Expect(sqsapi.DeleteMessageBehavior.SuccessfulCalls()).To(Equal(100))
 		})
-		It("should not delete a node when not owned by provisioner", func() {
-			node := coretest.Node(coretest.NodeOptions{
-				ProviderID: fake.ProviderID(string(uuid.NewUUID())),
-			})
-			ExpectMessagesCreated(spotInterruptionMessage(node.Spec.ProviderID))
-			ExpectApplied(ctx, env.Client, node)
-
-			ExpectReconcileSucceeded(ctx, controller, types.NamespacedName{})
-			Expect(sqsapi.ReceiveMessageBehavior.SuccessfulCalls()).To(Equal(1))
-			ExpectNodeExists(ctx, env.Client, node.Name)
-			Expect(sqsapi.DeleteMessageBehavior.SuccessfulCalls()).To(Equal(1))
-		})
 		It("should delete a message when the message can't be parsed", func() {
-			badMessage := &sqs.Message{
+			badMessage := &sqstypes.Message{
 				Body: aws.String(string(lo.Must(json.Marshal(map[string]string{
 					"field1": "value1",
 					"field2": "value2",
@@ -217,83 +226,72 @@ var _ = Describe("AWSInterruption", func() {
 
 			ExpectMessagesCreated(badMessage)
 
-			ExpectReconcileSucceeded(ctx, controller, types.NamespacedName{})
+			ExpectSingletonReconciled(ctx, controller)
 			Expect(sqsapi.ReceiveMessageBehavior.SuccessfulCalls()).To(Equal(1))
 			Expect(sqsapi.DeleteMessageBehavior.SuccessfulCalls()).To(Equal(1))
 		})
 		It("should delete a state change message when the state isn't in accepted states", func() {
-			node := coretest.Node(coretest.NodeOptions{
-				ObjectMeta: metav1.ObjectMeta{
-					Labels: map[string]string{
-						v1alpha5.ProvisionerNameLabelKey: "default",
-					},
-				},
-				ProviderID: fake.ProviderID(defaultInstanceID),
-			})
-			ExpectMessagesCreated(stateChangeMessage(defaultInstanceID, "creating"))
-			ExpectApplied(ctx, env.Client, node)
+			ExpectMessagesCreated(stateChangeMessage(lo.Must(utils.ParseInstanceID(nodeClaim.Status.ProviderID)), "creating"))
+			ExpectApplied(ctx, env.Client, nodeClaim, node)
 
-			ExpectReconcileSucceeded(ctx, controller, types.NamespacedName{})
+			ExpectSingletonReconciled(ctx, controller)
 			Expect(sqsapi.ReceiveMessageBehavior.SuccessfulCalls()).To(Equal(1))
-			ExpectNodeExists(ctx, env.Client, node.Name)
+			ExpectExists(ctx, env.Client, nodeClaim)
 			Expect(sqsapi.DeleteMessageBehavior.SuccessfulCalls()).To(Equal(1))
 		})
 		It("should mark the ICE cache for the offering when getting a spot interruption warning", func() {
-			node := coretest.Node(coretest.NodeOptions{
-				ObjectMeta: metav1.ObjectMeta{
-					Labels: map[string]string{
-						v1alpha5.ProvisionerNameLabelKey: "default",
-						v1.LabelTopologyZone:             "coretest-zone-1a",
-						v1.LabelInstanceTypeStable:       "t3.large",
-						v1alpha5.LabelCapacityType:       v1alpha1.CapacityTypeSpot,
-					},
-				},
-				ProviderID: fake.ProviderID(defaultInstanceID),
+			nodeClaim.Labels = lo.Assign(nodeClaim.Labels, map[string]string{
+				corev1.LabelTopologyZone:       "coretest-zone-1a",
+				corev1.LabelInstanceTypeStable: "t3.large",
+				karpv1.CapacityTypeLabelKey:    karpv1.CapacityTypeSpot,
 			})
-			ExpectMessagesCreated(spotInterruptionMessage(defaultInstanceID))
-			ExpectApplied(ctx, env.Client, node)
+			ExpectMessagesCreated(spotInterruptionMessage(lo.Must(utils.ParseInstanceID(nodeClaim.Status.ProviderID))))
+			ExpectApplied(ctx, env.Client, nodeClaim, node)
 
-			ExpectReconcileSucceeded(ctx, controller, types.NamespacedName{})
+			ExpectSingletonReconciled(ctx, controller)
 			Expect(sqsapi.ReceiveMessageBehavior.SuccessfulCalls()).To(Equal(1))
-			ExpectNotFound(ctx, env.Client, node)
+			ExpectNotFound(ctx, env.Client, nodeClaim)
 			Expect(sqsapi.DeleteMessageBehavior.SuccessfulCalls()).To(Equal(1))
 
 			// Expect a t3.large in coretest-zone-1a to be added to the ICE cache
-			Expect(unavailableOfferingsCache.IsUnavailable("t3.large", "coretest-zone-1a", v1alpha1.CapacityTypeSpot)).To(BeTrue())
-		})
-	})
-	Context("Error Handling", func() {
-		It("should send an error on polling when QueueNotExists", func() {
-			sqsapi.ReceiveMessageBehavior.Error.Set(awsErrWithCode(sqs.ErrCodeQueueDoesNotExist), fake.MaxCalls(0))
-			ExpectReconcileFailed(ctx, controller, types.NamespacedName{})
-		})
-		It("should send an error on polling when AccessDenied", func() {
-			sqsapi.ReceiveMessageBehavior.Error.Set(awsErrWithCode("AccessDenied"), fake.MaxCalls(0))
-			ExpectReconcileFailed(ctx, controller, types.NamespacedName{})
-		})
-		It("should not return an error when deleting a node that is already deleted", func() {
-			ExpectMessagesCreated(spotInterruptionMessage(defaultInstanceID))
-			ExpectReconcileSucceeded(ctx, controller, types.NamespacedName{})
+			Expect(unavailableOfferingsCache.IsUnavailable("t3.large", "coretest-zone-1a", karpv1.CapacityTypeSpot)).To(BeTrue())
 		})
 	})
 })
 
+var _ = Describe("Error Handling", func() {
+	It("should send an error on polling when QueueNotExists", func() {
+		sqsapi.ReceiveMessageBehavior.Error.Set(smithyErrWithCode("QueueDoesNotExist"), fake.MaxCalls(0))
+	})
+	It("should send an error on polling when AccessDenied", func() {
+		sqsapi.ReceiveMessageBehavior.Error.Set(smithyErrWithCode("AccessDenied"), fake.MaxCalls(0))
+		_ = ExpectSingletonReconcileFailed(ctx, controller)
+	})
+	It("should not return an error when deleting a nodeClaim that is already deleted", func() {
+		ExpectMessagesCreated(spotInterruptionMessage(fake.InstanceID()))
+		ExpectSingletonReconciled(ctx, controller)
+	})
+})
+
 func ExpectMessagesCreated(messages ...interface{}) {
-	raw := lo.Map(messages, func(m interface{}, _ int) *sqs.Message {
-		return &sqs.Message{
+	raw := lo.Map(messages, func(m interface{}, _ int) *sqstypes.Message {
+		return &sqstypes.Message{
 			Body:      aws.String(string(lo.Must(json.Marshal(m)))),
 			MessageId: aws.String(string(uuid.NewUUID())),
 		}
 	})
 	sqsapi.ReceiveMessageBehavior.Output.Set(
-		&sqs.ReceiveMessageOutput{
-			Messages: raw,
+		&servicesqs.ReceiveMessageOutput{
+			Messages: lo.FromSlicePtr(raw),
 		},
 	)
 }
 
-func awsErrWithCode(code string) awserr.Error {
-	return awserr.New(code, "", fmt.Errorf(""))
+func smithyErrWithCode(code string) smithy.APIError {
+	return &smithy.GenericAPIError{
+		Code:    code,
+		Message: "error",
+	}
 }
 
 func spotInterruptionMessage(involvedInstanceID string) spotinterruption.Message {
@@ -303,9 +301,9 @@ func spotInterruptionMessage(involvedInstanceID string) spotinterruption.Message
 			Account:    defaultAccountID,
 			DetailType: "EC2 Spot Instance Interruption Warning",
 			ID:         string(uuid.NewUUID()),
-			Region:     defaultRegion,
+			Region:     fake.DefaultRegion,
 			Resources: []string{
-				fmt.Sprintf("arn:aws:ec2:%s:instance/%s", defaultRegion, involvedInstanceID),
+				fmt.Sprintf("arn:aws:ec2:%s:instance/%s", fake.DefaultRegion, involvedInstanceID),
 			},
 			Source: ec2Source,
 			Time:   time.Now(),
@@ -324,9 +322,9 @@ func stateChangeMessage(involvedInstanceID, state string) statechange.Message {
 			Account:    defaultAccountID,
 			DetailType: "EC2 Instance State-change Notification",
 			ID:         string(uuid.NewUUID()),
-			Region:     defaultRegion,
+			Region:     fake.DefaultRegion,
 			Resources: []string{
-				fmt.Sprintf("arn:aws:ec2:%s:instance/%s", defaultRegion, involvedInstanceID),
+				fmt.Sprintf("arn:aws:ec2:%s:instance/%s", fake.DefaultRegion, involvedInstanceID),
 			},
 			Source: ec2Source,
 			Time:   time.Now(),
@@ -345,9 +343,9 @@ func scheduledChangeMessage(involvedInstanceID string) scheduledchange.Message {
 			Account:    defaultAccountID,
 			DetailType: "AWS Health Event",
 			ID:         string(uuid.NewUUID()),
-			Region:     defaultRegion,
+			Region:     fake.DefaultRegion,
 			Resources: []string{
-				fmt.Sprintf("arn:aws:ec2:%s:instance/%s", defaultRegion, involvedInstanceID),
+				fmt.Sprintf("arn:aws:ec2:%s:instance/%s", fake.DefaultRegion, involvedInstanceID),
 			},
 			Source: healthSource,
 			Time:   time.Now(),

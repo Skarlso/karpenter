@@ -15,69 +15,128 @@ limitations under the License.
 package events
 
 import (
-	"fmt"
+	corev1 "k8s.io/api/core/v1"
 
-	v1 "k8s.io/api/core/v1"
-
-	"github.com/aws/karpenter-core/pkg/events"
+	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
+	"sigs.k8s.io/karpenter/pkg/events"
 )
 
-func InstanceSpotInterrupted(node *v1.Node) events.Event {
-	return events.Event{
-		InvolvedObject: node,
-		Type:           v1.EventTypeWarning,
-		Reason:         "InstanceSpotInterrupted",
-		Message:        fmt.Sprintf("Node %s event: A spot interruption warning was triggered for the node", node.Name),
-		DedupeValues:   []string{node.Name},
+func SpotInterrupted(node *corev1.Node, nodeClaim *karpv1.NodeClaim) (evts []events.Event) {
+	evts = append(evts, events.Event{
+		InvolvedObject: nodeClaim,
+		Type:           corev1.EventTypeWarning,
+		Reason:         "SpotInterrupted",
+		Message:        "Spot interruption warning was triggered",
+		DedupeValues:   []string{string(nodeClaim.UID)},
+	})
+	if node != nil {
+		evts = append(evts, events.Event{
+			InvolvedObject: node,
+			Type:           corev1.EventTypeWarning,
+			Reason:         "SpotInterrupted",
+			Message:        "Spot interruption warning was triggered",
+			DedupeValues:   []string{string(node.UID)},
+		})
 	}
+	return evts
 }
 
-func InstanceRebalanceRecommendation(node *v1.Node) events.Event {
-	return events.Event{
-		InvolvedObject: node,
-		Type:           v1.EventTypeNormal,
-		Reason:         "InstanceSpotRebalanceRecommendation",
-		Message:        fmt.Sprintf("Node %s event: A spot rebalance recommendation was triggered for the node", node.Name),
-		DedupeValues:   []string{node.Name},
+func RebalanceRecommendation(node *corev1.Node, nodeClaim *karpv1.NodeClaim) (evts []events.Event) {
+	evts = append(evts, events.Event{
+		InvolvedObject: nodeClaim,
+		Type:           corev1.EventTypeNormal,
+		Reason:         "SpotRebalanceRecommendation",
+		Message:        "Spot rebalance recommendation was triggered",
+		DedupeValues:   []string{string(nodeClaim.UID)},
+	})
+	if node != nil {
+		evts = append(evts, events.Event{
+			InvolvedObject: node,
+			Type:           corev1.EventTypeNormal,
+			Reason:         "SpotRebalanceRecommendation",
+			Message:        "Spot rebalance recommendation was triggered",
+			DedupeValues:   []string{string(node.UID)},
+		})
 	}
+	return evts
 }
 
-func InstanceStopping(node *v1.Node) events.Event {
-	return events.Event{
-		InvolvedObject: node,
-		Type:           v1.EventTypeWarning,
+func Stopping(node *corev1.Node, nodeClaim *karpv1.NodeClaim) (evts []events.Event) {
+	evts = append(evts, events.Event{
+		InvolvedObject: nodeClaim,
+		Type:           corev1.EventTypeWarning,
 		Reason:         "InstanceStopping",
-		Message:        fmt.Sprintf("Node %s event: Instance is stopping", node.Name),
-		DedupeValues:   []string{node.Name},
+		Message:        "Instance is stopping",
+		DedupeValues:   []string{string(nodeClaim.UID)},
+	})
+	if node != nil {
+		evts = append(evts, events.Event{
+			InvolvedObject: node,
+			Type:           corev1.EventTypeWarning,
+			Reason:         "InstanceStopping",
+			Message:        "Instance is stopping",
+			DedupeValues:   []string{string(node.UID)},
+		})
 	}
+	return evts
 }
 
-func InstanceTerminating(node *v1.Node) events.Event {
-	return events.Event{
-		InvolvedObject: node,
-		Type:           v1.EventTypeWarning,
+func Terminating(node *corev1.Node, nodeClaim *karpv1.NodeClaim) (evts []events.Event) {
+	evts = append(evts, events.Event{
+		InvolvedObject: nodeClaim,
+		Type:           corev1.EventTypeWarning,
 		Reason:         "InstanceTerminating",
-		Message:        fmt.Sprintf("Node %s event: Instance is terminating", node.Name),
-		DedupeValues:   []string{node.Name},
+		Message:        "Instance is terminating",
+		DedupeValues:   []string{string(nodeClaim.UID)},
+	})
+	if node != nil {
+		evts = append(evts, events.Event{
+			InvolvedObject: node,
+			Type:           corev1.EventTypeWarning,
+			Reason:         "InstanceTerminating",
+			Message:        "Instance is terminating",
+			DedupeValues:   []string{string(node.UID)},
+		})
 	}
+	return evts
 }
 
-func InstanceUnhealthy(node *v1.Node) events.Event {
-	return events.Event{
-		InvolvedObject: node,
-		Type:           v1.EventTypeWarning,
+func Unhealthy(node *corev1.Node, nodeClaim *karpv1.NodeClaim) (evts []events.Event) {
+	evts = append(evts, events.Event{
+		InvolvedObject: nodeClaim,
+		Type:           corev1.EventTypeWarning,
 		Reason:         "InstanceUnhealthy",
-		Message:        fmt.Sprintf("Node %s event: An unhealthy warning was triggered for the node", node.Name),
-		DedupeValues:   []string{node.Name},
+		Message:        "An unhealthy warning was triggered for the instance",
+		DedupeValues:   []string{string(nodeClaim.UID)},
+	})
+	if node != nil {
+		evts = append(evts, events.Event{
+			InvolvedObject: node,
+			Type:           corev1.EventTypeWarning,
+			Reason:         "InstanceUnhealthy",
+			Message:        "An unhealthy warning was triggered for the instance",
+			DedupeValues:   []string{string(node.UID)},
+		})
 	}
+	return evts
 }
 
-func NodeTerminatingOnInterruption(node *v1.Node) events.Event {
-	return events.Event{
-		InvolvedObject: node,
-		Type:           v1.EventTypeWarning,
-		Reason:         "NodeTerminatingOnInterruption",
-		Message:        fmt.Sprintf("Node %s event: Interruption triggered termination for the node", node.Name),
-		DedupeValues:   []string{node.Name},
+func TerminatingOnInterruption(node *corev1.Node, nodeClaim *karpv1.NodeClaim) (evts []events.Event) {
+	evts = append(evts, events.Event{
+		InvolvedObject: nodeClaim,
+		Type:           corev1.EventTypeWarning,
+		Reason:         "TerminatingOnInterruption",
+		Message:        "Interruption triggered termination for the NodeClaim",
+		DedupeValues:   []string{string(nodeClaim.UID)},
+	})
+	if node != nil {
+		evts = append(evts, events.Event{
+			InvolvedObject: node,
+			Type:           corev1.EventTypeWarning,
+			Reason:         "TerminatingOnInterruption",
+			Message:        "Interruption triggered termination for the Node",
+			DedupeValues:   []string{string(node.UID)},
+		})
 	}
+	return evts
 }

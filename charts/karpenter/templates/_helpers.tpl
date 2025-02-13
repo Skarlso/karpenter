@@ -64,6 +64,24 @@ Create the name of the service account to use
 {{- end }}
 {{- end }}
 
+{{/*
+Karpenter image to use
+*/}}
+{{- define "karpenter.controller.image" -}}
+{{- if .Values.controller.image.digest }}
+{{- printf "%s:%s@%s" .Values.controller.image.repository  (default (printf "%s" .Chart.AppVersion) .Values.controller.image.tag) .Values.controller.image.digest }}
+{{- else }}
+{{- printf "%s:%s" .Values.controller.image.repository  (default (printf "%s" .Chart.AppVersion) .Values.controller.image.tag) }}
+{{- end }}
+{{- end }}
+
+{{/*
+Karpenter controller container name
+*/}}
+{{- define "karpenter.controller.containerName" -}}
+{{- .Values.controller.containerName | default "controller" -}}
+{{- end -}}
+
 {{/* Get PodDisruptionBudget API Version */}}
 {{- define "karpenter.pdb.apiVersion" -}}
 {{- if and (.Capabilities.APIVersions.Has "policy/v1") (semverCompare ">= 1.21-0" .Capabilities.KubeVersion.Version) -}}
@@ -74,50 +92,57 @@ Create the name of the service account to use
 {{- end -}}
 
 {{/*
-Flatten Settings Map using "." syntax
+Patch the label selector on an object
+This template will add a labelSelector using matchLabels to the object referenced at _target if there is no labelSelector specified.
+The matchLabels are created with the selectorLabels template.
+This works because Helm treats dictionaries as mutable objects and allows passing them by reference.
 */}}
-{{- define "flattenSettings" -}}
-{{- $map := first . -}}
-{{- $label := last . -}}
-{{- range $key := (keys $map | uniq | sortAlpha) }}
-  {{- $sublabel := $key -}}
-  {{- $val := (get $map $key) -}}
-  {{- if $label -}}
-    {{- $sublabel = list $label $key | join "." -}}
-  {{- end -}}
-  {{/* Special-case "tags" since we want this to be a JSON object */}}
-  {{- if eq $key "tags" -}}
-    {{- if not (kindIs "invalid" $val) -}}
-      {{- $sublabel | quote | nindent 2 }}: {{ $val | toJson | quote }}
-    {{- end -}}
-  {{- else if kindOf $val | eq "map" -}}
-    {{- list $val $sublabel | include "flattenSettings" -}}
-  {{- else -}}
-  {{- if not (kindIs "invalid" $val) -}}
-    {{- $sublabel | quote | nindent 2 -}}: {{ $val | quote }}
-  {{- end -}}
-{{- end -}}
-{{- end -}}
-{{- end -}}
+{{- define "karpenter.patchLabelSelector" -}}
+{{- if not (hasKey ._target "labelSelector") }}
+{{- $selectorLabels := (include "karpenter.selectorLabels" .) | fromYaml }}
+{{- $_ := set ._target "labelSelector" (dict "matchLabels" $selectorLabels) }}
+{{- end }}
+{{- end }}
 
 {{/*
-Flatten the stdout logging outputs from args provided
+Patch pod affinity
+This template uses the patchLabelSelector template to add a labelSelector to pod affinity objects if there is no labelSelector specified.
+This works because Helm treats dictionaries as mutable objects and allows passing them by reference.
 */}}
-{{- define "karpenter.controller.outputPathsList" -}}
-{{ $paths := list -}}
-{{- range .Values.controller.outputPaths -}}
-    {{- $paths = printf "%s" . | quote  | append $paths -}}
-{{- end -}}
-{{ $paths | join ", " }}
-{{- end -}}
+{{- define "karpenter.patchPodAffinity" -}}
+{{- if (hasKey ._podAffinity "requiredDuringSchedulingIgnoredDuringExecution") }}
+{{- range $term := ._podAffinity.requiredDuringSchedulingIgnoredDuringExecution }}
+{{- include "karpenter.patchLabelSelector" (merge (dict "_target" $term) $) }}
+{{- end }}
+{{- end }}
+{{- if (hasKey ._podAffinity "preferredDuringSchedulingIgnoredDuringExecution") }}
+{{- range $weightedTerm := ._podAffinity.preferredDuringSchedulingIgnoredDuringExecution }}
+{{- include "karpenter.patchLabelSelector" (merge (dict "_target" $weightedTerm.podAffinityTerm) $) }}
+{{- end }}
+{{- end }}
+{{- end }}
 
 {{/*
-Flatten the stderr logging outputs from args provided
+Patch affinity
+This template uses patchPodAffinity template to add a labelSelector to podAffinity & podAntiAffinity if one isn't specified.
+This works because Helm treats dictionaries as mutable objects and allows passing them by reference.
 */}}
-{{- define "karpenter.controller.errorOutputPathsList" -}}
-{{ $paths := list -}}
-{{- range .Values.controller.errorOutputPaths -}}
-    {{- $paths = printf "%s" . | quote  | append $paths -}}
-{{- end -}}
-{{ $paths | join ", " }}
-{{- end -}}
+{{- define "karpenter.patchAffinity" -}}
+{{- if (hasKey .Values.affinity "podAffinity") }}
+{{- include "karpenter.patchPodAffinity" (merge (dict "_podAffinity" .Values.affinity.podAffinity) .) }}
+{{- end }}
+{{- if (hasKey .Values.affinity "podAntiAffinity") }}
+{{- include "karpenter.patchPodAffinity" (merge (dict "_podAffinity" .Values.affinity.podAntiAffinity) .) }}
+{{- end }}
+{{- end }}
+
+{{/*
+Patch topology spread constraints
+This template uses the patchLabelSelector template to add a labelSelector to topologySpreadConstraints if one isn't specified.
+This works because Helm treats dictionaries as mutable objects and allows passing them by reference.
+*/}}
+{{- define "karpenter.patchTopologySpreadConstraints" -}}
+{{- range $constraint := .Values.topologySpreadConstraints }}
+{{- include "karpenter.patchLabelSelector" (merge (dict "_target" $constraint) $) }}
+{{- end }}
+{{- end }}

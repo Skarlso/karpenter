@@ -15,50 +15,54 @@ limitations under the License.
 package integration_test
 
 import (
-	"fmt"
-	"sort"
 	"time"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/service/ec2"
-	. "github.com/onsi/ginkgo/v2"
-	. "github.com/onsi/gomega"
+	"github.com/aws/aws-sdk-go-v2/service/ec2"
+	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
+	"github.com/awslabs/operatorpkg/status"
 	"github.com/onsi/gomega/types"
 	"github.com/samber/lo"
-	v1 "k8s.io/api/core/v1"
+	"github.com/samber/lo/mutable"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	"github.com/aws/karpenter-core/pkg/apis/v1alpha5"
-	"github.com/aws/karpenter-core/pkg/test"
-	"github.com/aws/karpenter/pkg/apis/settings"
-	"github.com/aws/karpenter/pkg/apis/v1alpha1"
-	awstest "github.com/aws/karpenter/pkg/test"
+	"sigs.k8s.io/karpenter/pkg/test"
+
+	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
+
+	v1 "github.com/aws/karpenter-provider-aws/pkg/apis/v1"
+	"github.com/aws/karpenter-provider-aws/test/pkg/environment/aws"
+
+	. "github.com/awslabs/operatorpkg/test/expectations"
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
 )
 
 var _ = Describe("Subnets", func() {
 	It("should use the subnet-id selector", func() {
-		subnets := env.GetSubnets(map[string]string{"karpenter.sh/discovery": settings.FromContext(env.Context).ClusterName})
+		subnets := env.GetSubnets(map[string]string{"karpenter.sh/discovery": env.ClusterName})
 		Expect(len(subnets)).ToNot(Equal(0))
-		shuffledAZs := lo.Shuffle(lo.Keys(subnets))
+		shuffledAZs := lo.Keys(subnets)
+		mutable.Shuffle(shuffledAZs)
 		firstSubnet := subnets[shuffledAZs[0]][0]
 
-		provider := awstest.AWSNodeTemplate(v1alpha1.AWSNodeTemplateSpec{
-			AWS: v1alpha1.AWS{
-				SecurityGroupSelector: map[string]string{"karpenter.sh/discovery": settings.FromContext(env.Context).ClusterName},
-				SubnetSelector:        map[string]string{"aws-ids": firstSubnet},
+		nodeClass.Spec.SubnetSelectorTerms = []v1.SubnetSelectorTerm{
+			{
+				ID: firstSubnet,
 			},
-		})
-		provisioner := test.Provisioner(test.ProvisionerOptions{ProviderRef: &v1alpha5.ProviderRef{Name: provider.Name}})
+		}
 		pod := test.Pod()
 
-		env.ExpectCreated(pod, provider, provisioner)
+		env.ExpectCreated(pod, nodeClass, nodePool)
 		env.EventuallyExpectHealthy(pod)
 		env.ExpectCreatedNodeCount("==", 1)
 
 		env.ExpectInstance(pod.Spec.NodeName).To(HaveField("SubnetId", HaveValue(Equal(firstSubnet))))
 	})
 	It("should use resource based naming as node names", func() {
-		subnets := env.GetSubnets(map[string]string{"karpenter.sh/discovery": settings.FromContext(env.Context).ClusterName})
+		subnets := env.GetSubnets(map[string]string{"karpenter.sh/discovery": env.ClusterName})
 		Expect(len(subnets)).ToNot(Equal(0))
 
 		allSubnets := lo.Flatten(lo.Values(subnets))
@@ -67,17 +71,9 @@ var _ = Describe("Subnets", func() {
 		DeferCleanup(func() {
 			ExpectResourceBasedNamingDisabled(allSubnets...)
 		})
-
-		provider := awstest.AWSNodeTemplate(v1alpha1.AWSNodeTemplateSpec{
-			AWS: v1alpha1.AWS{
-				SecurityGroupSelector: map[string]string{"karpenter.sh/discovery": settings.FromContext(env.Context).ClusterName},
-				SubnetSelector:        map[string]string{"karpenter.sh/discovery": settings.FromContext(env.Context).ClusterName},
-			},
-		})
-		provisioner := test.Provisioner(test.ProvisionerOptions{ProviderRef: &v1alpha5.ProviderRef{Name: provider.Name}})
 		pod := test.Pod()
 
-		env.ExpectCreated(pod, provider, provisioner)
+		env.ExpectCreated(pod, nodeClass, nodePool)
 		env.EventuallyExpectHealthy(pod)
 		env.ExpectCreatedNodeCount("==", 1)
 
@@ -85,21 +81,22 @@ var _ = Describe("Subnets", func() {
 	})
 	It("should use the subnet tag selector with multiple tag values", func() {
 		// Get all the subnets for the cluster
-		subnets := env.GetSubnetNameAndIds(map[string]string{"karpenter.sh/discovery": settings.FromContext(env.Context).ClusterName})
+		subnets := env.GetSubnetInfo(map[string]string{"karpenter.sh/discovery": env.ClusterName})
 		Expect(len(subnets)).To(BeNumerically(">", 1))
 		firstSubnet := subnets[0]
 		lastSubnet := subnets[len(subnets)-1]
 
-		provider := awstest.AWSNodeTemplate(v1alpha1.AWSNodeTemplateSpec{
-			AWS: v1alpha1.AWS{
-				SecurityGroupSelector: map[string]string{"karpenter.sh/discovery": settings.FromContext(env.Context).ClusterName},
-				SubnetSelector:        map[string]string{"Name": fmt.Sprintf("%s,%s", firstSubnet.Name, lastSubnet.Name)},
+		nodeClass.Spec.SubnetSelectorTerms = []v1.SubnetSelectorTerm{
+			{
+				Tags: map[string]string{"Name": firstSubnet.Name},
 			},
-		})
-		provisioner := test.Provisioner(test.ProvisionerOptions{ProviderRef: &v1alpha5.ProviderRef{Name: provider.Name}})
+			{
+				Tags: map[string]string{"Name": lastSubnet.Name},
+			},
+		}
 		pod := test.Pod()
 
-		env.ExpectCreated(pod, provider, provisioner)
+		env.ExpectCreated(pod, nodeClass, nodePool)
 		env.EventuallyExpectHealthy(pod)
 		env.ExpectCreatedNodeCount("==", 1)
 
@@ -107,29 +104,20 @@ var _ = Describe("Subnets", func() {
 	})
 
 	It("should use a subnet within the AZ requested", func() {
-		subnets := env.GetSubnets(map[string]string{"karpenter.sh/discovery": settings.FromContext(env.Context).ClusterName})
+		subnets := env.GetSubnets(map[string]string{"karpenter.sh/discovery": env.ClusterName})
 		Expect(len(subnets)).ToNot(Equal(0))
-		shuffledAZs := lo.Shuffle(lo.Keys(subnets))
+		shuffledAZs := lo.Keys(subnets)
+		mutable.Shuffle(shuffledAZs)
 
-		provider := awstest.AWSNodeTemplate(v1alpha1.AWSNodeTemplateSpec{
-			AWS: v1alpha1.AWS{
-				SecurityGroupSelector: map[string]string{"karpenter.sh/discovery": settings.FromContext(env.Context).ClusterName},
-				SubnetSelector:        map[string]string{"karpenter.sh/discovery": settings.FromContext(env.Context).ClusterName},
-			},
-		})
-		provisioner := test.Provisioner(test.ProvisionerOptions{
-			ProviderRef: &v1alpha5.ProviderRef{Name: provider.Name},
-			Requirements: []v1.NodeSelectorRequirement{
-				{
-					Key:      v1.LabelZoneFailureDomainStable,
-					Operator: "In",
-					Values:   []string{shuffledAZs[0]},
-				},
-			},
-		})
+		test.ReplaceRequirements(nodePool, karpv1.NodeSelectorRequirementWithMinValues{
+			NodeSelectorRequirement: corev1.NodeSelectorRequirement{
+				Key:      corev1.LabelZoneFailureDomainStable,
+				Operator: "In",
+				Values:   []string{shuffledAZs[0]},
+			}})
 		pod := test.Pod()
 
-		env.ExpectCreated(pod, provider, provisioner)
+		env.ExpectCreated(pod, nodeClass, nodePool)
 		env.EventuallyExpectHealthy(pod)
 		env.ExpectCreatedNodeCount("==", 1)
 
@@ -138,31 +126,36 @@ var _ = Describe("Subnets", func() {
 		)))
 	})
 
-	It("should have the AWSNodeTemplateStatus for subnets", func() {
-		provider := awstest.AWSNodeTemplate(v1alpha1.AWSNodeTemplateSpec{
-			AWS: v1alpha1.AWS{
-				SecurityGroupSelector: map[string]string{"karpenter.sh/discovery": settings.FromContext(env.Context).ClusterName},
-				SubnetSelector:        map[string]string{"karpenter.sh/discovery": settings.FromContext(env.Context).ClusterName},
+	It("should have the NodeClass status for subnets", func() {
+		env.ExpectCreated(nodeClass)
+		EventuallyExpectSubnets(env, nodeClass)
+		ExpectStatusConditions(env, env.Client, 1*time.Minute, nodeClass, status.Condition{Type: v1.ConditionTypeSubnetsReady, Status: metav1.ConditionTrue})
+		ExpectStatusConditions(env, env.Client, 1*time.Minute, nodeClass, status.Condition{Type: status.ConditionReady, Status: metav1.ConditionTrue})
+	})
+	It("should have the NodeClass status as not ready since subnets were not resolved", func() {
+		nodeClass.Spec.SubnetSelectorTerms = []v1.SubnetSelectorTerm{
+			{
+				Tags: map[string]string{"karpenter.sh/discovery": "invalidName"},
 			},
-		})
-
-		env.ExpectCreated(provider)
-		EventuallyExpectSubnets(provider)
+		}
+		env.ExpectCreated(nodeClass)
+		ExpectStatusConditions(env, env.Client, 1*time.Minute, nodeClass, status.Condition{Type: v1.ConditionTypeSubnetsReady, Status: metav1.ConditionFalse, Message: "SubnetSelector did not match any Subnets"})
+		ExpectStatusConditions(env, env.Client, 1*time.Minute, nodeClass, status.Condition{Type: status.ConditionReady, Status: metav1.ConditionFalse, Message: "ValidationSucceeded=False, SubnetsReady=False"})
 	})
 })
 
 func ExpectResourceBasedNamingEnabled(subnetIDs ...string) {
 	for subnetID := range subnetIDs {
-		_, err := env.EC2API.ModifySubnetAttribute(&ec2.ModifySubnetAttributeInput{
-			EnableResourceNameDnsARecordOnLaunch: &ec2.AttributeBooleanValue{
-				Value: aws.Bool(true),
+		_, err := env.EC2API.ModifySubnetAttribute(env.Context, &ec2.ModifySubnetAttributeInput{
+			EnableResourceNameDnsARecordOnLaunch: &ec2types.AttributeBooleanValue{
+				Value: lo.ToPtr(true),
 			},
-			SubnetId: aws.String(subnetIDs[subnetID]),
+			SubnetId: lo.ToPtr(subnetIDs[subnetID]),
 		})
 		Expect(err).To(BeNil())
-		_, err = env.EC2API.ModifySubnetAttribute(&ec2.ModifySubnetAttributeInput{
-			PrivateDnsHostnameTypeOnLaunch: aws.String("resource-name"),
-			SubnetId:                       aws.String(subnetIDs[subnetID]),
+		_, err = env.EC2API.ModifySubnetAttribute(env.Context, &ec2.ModifySubnetAttributeInput{
+			PrivateDnsHostnameTypeOnLaunch: "resource-name",
+			SubnetId:                       lo.ToPtr(subnetIDs[subnetID]),
 		})
 		Expect(err).To(BeNil())
 	}
@@ -170,16 +163,16 @@ func ExpectResourceBasedNamingEnabled(subnetIDs ...string) {
 
 func ExpectResourceBasedNamingDisabled(subnetIDs ...string) {
 	for subnetID := range subnetIDs {
-		_, err := env.EC2API.ModifySubnetAttribute(&ec2.ModifySubnetAttributeInput{
-			EnableResourceNameDnsARecordOnLaunch: &ec2.AttributeBooleanValue{
-				Value: aws.Bool(false),
+		_, err := env.EC2API.ModifySubnetAttribute(env.Context, &ec2.ModifySubnetAttributeInput{
+			EnableResourceNameDnsARecordOnLaunch: &ec2types.AttributeBooleanValue{
+				Value: lo.ToPtr(false),
 			},
-			SubnetId: aws.String(subnetIDs[subnetID]),
+			SubnetId: lo.ToPtr(subnetIDs[subnetID]),
 		})
 		Expect(err).To(BeNil())
-		_, err = env.EC2API.ModifySubnetAttribute(&ec2.ModifySubnetAttributeInput{
-			PrivateDnsHostnameTypeOnLaunch: aws.String("ip-name"),
-			SubnetId:                       aws.String(subnetIDs[subnetID]),
+		_, err = env.EC2API.ModifySubnetAttribute(env.Context, &ec2.ModifySubnetAttributeInput{
+			PrivateDnsHostnameTypeOnLaunch: "ip-name",
+			SubnetId:                       lo.ToPtr(subnetIDs[subnetID]),
 		})
 		Expect(err).To(BeNil())
 	}
@@ -187,8 +180,8 @@ func ExpectResourceBasedNamingDisabled(subnetIDs ...string) {
 
 func ExceptNodeNameToContainInstanceID(nodeName string) {
 	instance := env.GetInstance(nodeName)
-	Expect(nodeName).To(Not(Equal(aws.StringValue(instance.InstanceId))))
-	ContainSubstring(nodeName, aws.StringValue(instance.InstanceId))
+	Expect(nodeName).To(Not(Equal(lo.FromPtr(instance.InstanceId))))
+	ContainSubstring(nodeName, lo.FromPtr(instance.InstanceId))
 }
 
 // SubnetInfo is a simple struct for testing
@@ -197,22 +190,16 @@ type SubnetInfo struct {
 	ID   string
 }
 
-func EventuallyExpectSubnets(provider *v1alpha1.AWSNodeTemplate) {
-	subnets := env.GetSubnets(map[string]string{"karpenter.sh/discovery": settings.FromContext(env.Context).ClusterName})
-	Expect(len(subnets)).ToNot(Equal(0))
-	subnetIDs := lo.Flatten(lo.Values(subnets))
-	sort.Strings(subnetIDs)
+func EventuallyExpectSubnets(env *aws.Environment, nodeClass *v1.EC2NodeClass) {
+	subnets := env.GetSubnets(map[string]string{"karpenter.sh/discovery": env.ClusterName})
+	Expect(subnets).ToNot(HaveLen(0))
+	ids := sets.New(lo.Flatten(lo.Values(subnets))...)
 
 	Eventually(func(g Gomega) {
-		var ant v1alpha1.AWSNodeTemplate
-		if err := env.Client.Get(env, client.ObjectKeyFromObject(provider), &ant); err != nil {
-			return
-		}
-		subnetIDsInStatus := lo.Map(ant.Status.Subnets, func(subnet v1alpha1.SubnetStatus, _ int) string {
-			return subnet.ID
-		})
-
-		sort.Strings(subnetIDsInStatus)
-		g.Expect(subnetIDsInStatus).To(Equal(subnetIDs))
+		temp := &v1.EC2NodeClass{}
+		g.Expect(env.Client.Get(env, client.ObjectKeyFromObject(nodeClass), temp)).To(Succeed())
+		g.Expect(sets.New(lo.Map(temp.Status.Subnets, func(s v1.Subnet, _ int) string {
+			return s.ID
+		})...).Equal(ids))
 	}).WithTimeout(10 * time.Second).Should(Succeed())
 }
